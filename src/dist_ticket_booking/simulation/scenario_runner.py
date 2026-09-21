@@ -1,18 +1,4 @@
-"""Scenario runner placeholder.
-
-Owner: Person B (Simulation and Validation)
-Primary responsibility: simulate distributed booking contention and state changes.
-
-Functions to implement in this file:
-- ScenarioRunner.__init__
-- ScenarioRunner.add_event
-- ScenarioRunner.run
-
-TODO for Milestone 1:
-- define at least 2-3 simulation scenarios for ticket contention
-- log request order, lock acquisition, and final booking state
-- verify correctness under concurrent request generation
-"""
+"""Scenario runner for simulating booking request flows."""
 
 
 class ScenarioRunner:
@@ -25,6 +11,16 @@ class ScenarioRunner:
         self.events.append({"event": event_name, "details": details or {}})
         return self.events
 
-    def run(self):
-        """Placeholder run method for future simulation logic."""
-        return {"status": "ready", "events": self.events}
+    def run(self, requests=None):
+        """Execute a simple scenario over a list of requests.
+
+        The current implementation is deliberately minimal and intended for the
+        Milestone 1 simulation layer.
+        """
+        if requests is None:
+            requests = []
+
+        for request in requests:
+            self.add_event("request_received", {"request_id": getattr(request, "request_id", "unknown")})
+
+        return {"status": "ready", "events": self.events, "request_count": len(requests)}

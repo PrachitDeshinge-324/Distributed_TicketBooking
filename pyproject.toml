@@ -8,6 +8,11 @@ version = "0.1.0"
 description = "Python-first Distributed Ticket Booking System for AOS assignment"
 readme = "README.md"
 requires-python = ">=3.10"
+dependencies = [
+    "grpcio>=1.60.0",
+    "grpcio-tools>=1.60.0",
+    "protobuf>=4.25.0"
+]
 authors = [{ name = "Team AOS" }]
 
 [tool.setuptools]

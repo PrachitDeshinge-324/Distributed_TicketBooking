@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package ticketservice.v1;
+
+service TicketClientService {
+  rpc Login(LoginRequest) returns (LoginResponse);
+  rpc Logout(LogoutRequest) returns (StatusResponse);
+  rpc Post(PostRequest) returns (StatusResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+}
+
+service TicketAppService {
+  rpc ProcessBusinessRequest(BusinessRequest) returns (StatusResponse);
+  rpc GetLLMAnswer(LLMQueryRequest) returns (GetLLMAnswerResponse);
+}
+
+service LLMService {
+  rpc GetLLMAnswer(LLMQueryRequest) returns (GetLLMAnswerResponse);
+}
+
+// --- Messages for Client Functions ---
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message LoginResponse {
+  string status = 1;
+  optional string token = 2;
+}
+
+message LogoutRequest {
+  string token = 1;
+}
+
+message StatusResponse {
+  string status = 1;
+  string message = 2;
+}
+
+message PostRequest {
+  string token = 1;
+  string type = 2;
+  string data = 3; // JSON string containing payload (e.g. ticket_id, quantity)
+}
+
+message GetRequest {
+  string token = 1;
+  string type = 2;
+  optional string params = 3; // JSON string or query parameter
+}
+
+message DataItem {
+  string id = 1;
+  string data = 2; // JSON string representing the object
+}
+
+message GetResponse {
+  string status = 1;
+  repeated DataItem items = 2;
+}
+
+// --- Messages for Application Server Functions ---
+
+message BusinessRequest {
+  string request_id = 1;
+  string payload = 2; // JSON string
+  string context = 3; // JSON string
+}
+
+// --- Messages for LLM Server Functions ---
+
+message LLMQueryRequest {
+  string request_id = 1;
+  string query = 2;
+  string context = 3;
+}
+
+message GetLLMAnswerResponse {
+  string request_id = 1;
+  string answer = 2;
+}
+
+// Alias for backward compatibility
+message LLMQueryResponse {
+  string request_id = 1;
+  string answer = 2;
+}
