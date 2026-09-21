@@ -1,104 +1,103 @@
 # Distributed Ticket Booking System
 
-This repository is built for the Advanced Operating Systems and Distributed Systems coursework. The focus is not on a web frontend or an API service layer; the emphasis is on the core distributed-system behavior, concurrency control, coordination, and process-level design.
+Project for CS G623 (Advanced Operating Systems).
+Milestone 1 focuses on core client-server communication using gRPC, local concurrency control for seat reservations, mock payment handling, and a domain LLM service for customer support FAQs.
 
-## Primary Language
+## Architecture
 
-Python is the primary language for this project. The codebase is structured to support simulation, coordination logic, scheduling experiments, and distributed-system modules instead of UI or web development.
+The project consists of three components communicating via gRPC:
 
-## Project Goal
+- **LLM Server (Node 1)**: Independent service listening on port 50052, providing answers to user questions (e.g., cancellation policies, seat queries).
+- **Application Server (Node 2)**: Core business logic server listening on port 50051. Manages ticket inventory, enforces lock-based concurrency control to prevent overbooking, handles mock payment validation, and proxies FAQ queries to Node 1.
+- **Client Node (Node 5)**: Client implementation for user interactions (login, check availability, book seats, ask FAQs, logout).
 
-The project models a distributed ticket booking system with emphasis on:
+## Setup
 
-- process synchronization
-- distributed coordination
-- mutual exclusion and locking
-- leader election or distributed decision making
-- failure tolerance and consistency awareness
-- event-driven simulation of ticket booking behavior
+Create a virtual environment and install dependencies:
 
-## Milestone 1 Scope
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
 
-This repository is limited to Milestone 1 only.
+To recompile proto definitions if modified:
 
-Current focus:
+```bash
+bash scripts/generate_grpc.sh
+```
 
-- architecture planning
-- module boundary definitions
-- Python project skeleton
-- shared contracts and interfaces
-- parallel task split for two contributors
-- test and simulation placeholders
+## Running the System
 
-No full implementation is included yet. This phase is intentionally setup-only.
+### Automated Demo
 
-## Two-Person Workflow
+Run both servers and the client test scenarios in a single command:
 
-To avoid waiting phases:
+```bash
+python scripts/run_all_demo.py
+```
 
-- Person A: distributed coordination, scheduler, and lock-related logic
-- Person B: simulation, logging, validation, and testing scaffolding
-- Both work from the same shared contracts and data models
-- Keep interfaces explicit before implementing behavior
+### Manual Execution
 
-## Repository Layout
+Run each node in separate terminals:
 
-- src/dist_ticket_booking/ — Python package for the core system
-- docs/ — design, milestone, and workflow notes
-- tests/ — test placeholders and contract checks
-- scripts/ — local utility scripts for running examples or diagnostics
+1. **Terminal 1 - LLM Server**:
+   ```bash
+   python scripts/run_llm_server.py --port 50052
+   ```
 
-## Python Project Structure
+2. **Terminal 2 - Application Server**:
+   ```bash
+   python scripts/run_server.py --port 50051 --llm-port 50052
+   ```
 
-- core/ — shared models and system state
-- coordination/ — locks, synchronization, leader election, message coordination
-- scheduler/ — resource and process scheduling logic
-- simulation/ — event simulation for distributed ticket booking behavior
-- monitoring/ — logs, metrics, and system-state observation
-- utils/ — helper functions and reusable Python components
+3. **Terminal 3 - Client Demo**:
+   ```bash
+   python scripts/client_demo.py
+   python scripts/demo_concurrency.py
+   ```
 
-## Initial Setup Rules
+## Testing
 
-- keep modules isolated
-- define data contracts early
-- use Python dataclasses and typed interfaces where useful
-- avoid full business logic before the shared model is agreed
-- commit incremental progress in small pieces
+Run all unit and integration tests:
 
-## Branching Strategy
+```bash
+pytest tests/ -v
+```
 
-- main — clean integration branch
-- feature/core-models — shared ticket and booking domain models
-- feature/coordination — distributed algorithms and locking skeleton
-- feature/simulation — simulation and validation layer
-- feature/docs-architecture — design and milestone documentation
+Tests include:
+- Contract tests for models and lock manager (`tests/test_contracts.py`)
+- Business logic, validation, and LLM stub tests (`tests/test_business_and_grpc_contracts.py`)
+- End-to-end gRPC integration and concurrent booking tests (`tests/test_grpc_integration.py`)
 
-## Quick Start
+## Project Structure
 
-1. Open the repo in VS Code
-2. Review the docs folder
-3. Start with the Python package under src/
-4. Split the work according to the contribution plan
-5. Keep Milestone 1 limited to architecture and skeleton logic
+```
+├── proto/
+│   └── ticket_service.proto
+├── src/dist_ticket_booking/
+│   ├── business/
+│   │   └── booking_service.py
+│   ├── coordination/
+│   │   └── lock_manager.py
+│   ├── core/
+│   │   └── models.py
+│   ├── grpc/
+│   │   ├── service.py
+│   │   ├── ticket_service_pb2.py
+│   │   └── ticket_service_pb2_grpc.py
+│   └── llm/
+│       └── domain_llm.py
+├── scripts/
+│   ├── run_llm_server.py
+│   ├── run_server.py
+│   ├── client_demo.py
+│   ├── demo_concurrency.py
+│   ├── run_all_demo.py
+│   └── generate_grpc.sh
+└── tests/
+    ├── test_contracts.py
+    ├── test_business_and_grpc_contracts.py
+    └── test_grpc_integration.py
+```
 
-## Developer File Map
-
-Person A should start here:
-
-- src/dist_ticket_booking/core/models.py
-- src/dist_ticket_booking/coordination/lock_manager.py
-- src/dist_ticket_booking/scheduler/dispatcher.py
-
-Person B should start here:
-
-- src/dist_ticket_booking/simulation/scenario_runner.py
-- src/dist_ticket_booking/monitoring/logger.py
-- tests/test_contracts.py
-
-Shared reference file:
-
-- docs/architecture.md
-
-## Notes
-
-This repo is intentionally a boilerplate foundation for the Advanced Operating Systems and Distributed Systems assignment. The actual distributed algorithms and ticket-booking behavior are planned for later milestones.

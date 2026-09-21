@@ -1,58 +1,70 @@
-# Milestone 1 Plan
+# Milestone 1 Plan: Distributed Ticket Booking System
 
-## Objective
+Reference: **Advanced Operating Systems (CS G623) Project Assignment**  
+Topic: **Architecture A - Distributed Ticket Booking System**
 
-Set up the initial Python-first project skeleton and define the architecture needed for the Distributed Ticket Booking System in an Advanced Operating Systems and Distributed Systems context.
+---
 
-## Goals
+## Milestone 1 Objectives & Scope
 
-- establish repository structure
-- define system components
-- define Python modules for core logic, coordination, and simulation
-- create boilerplate files with purpose statements
-- assign parallel responsibilities to two contributors
-- prepare a foundation for future milestones
+Milestone 1 establishes the foundation for the distributed ticket booking system using **Python** and the **gRPC framework**, integrating a dedicated **domain-specific LLM server** for customer support FAQs, and enforcing **concurrency control** during real-time seat reservations.
 
-## Included in Milestone 1
+### Key Objectives
+- **Basic gRPC Service Architecture**: Inter-service communication strictly implemented via gRPC in Python.
+- **Client-Server Communication & Authentication**: Session management with `login` and `logout`.
+- **Fundamental Business Logic & Concurrency Control**: Real-time seat reservation with concurrency control to prevent race conditions and overbooking.
+- **Payment Processing**: Integrated mock payment processing gateway.
+- **Domain LLM Integration**: Customer support chatbot running on an independent server (Node 1) answering FAQ queries.
+- **Clean Node Separation**:
+  - **Node 1: AI/LLM Server**: Operates independently, serving `getLLMAnswer`.
+  - **Node 2: Application Server**: Manages core business logic, seat inventory, and concurrency locks.
+  - **Node 5: Client Node (multiple)**: Simulates concurrent user interactions.
 
-- project initialization
-- architecture docs
-- Python package structure
-- shared ticket and booking contracts
-- coordination and scheduler placeholders
-- simulation and monitoring skeleton
-- role-based parallel workflow planning
+---
 
-## Not Included in Milestone 1
+## Core RPC Function Signatures (from Assessment PDF)
 
-- full distributed runtime implementation
-- final concurrency algorithm selection
-- production-grade fault tolerance
-- UI or web-based frontend
-- complete business logic for booking flow
+### 1. Client Functions (Client -> Application Server)
+- `login(username, password)` -> `loginResponse(status, Optional(token))`
+  - Authenticates a user and issues a session token.
+- `logout(token)` -> `status`
+  - Terminates the user session and invalidates the token.
+- `post(token, type, data)` -> `status`
+  - Sends new requests (e.g. seat booking, cancellation).
+- `get(token, type, Optional(params))` -> `getResponse(status, List[(id, data)])`
+  - Retrieves system data (seat availability, FAQs).
 
-## Deliverables
+### 2. Application Server Functions
+- `loginResponse(status, Optional(token))`
+  - Returns result of login request.
+- `getResponse(status, List[(id, data)])`
+  - Returns requested items to client.
+- `processBusinessRequest(requestId, payload, context)`
+  - Handles domain-specific operations (seat reservation, cancellations, FAQ queries) and interacts with the LLM server over gRPC.
 
-- README
-- architecture overview
-- workflow plan
-- coordination and scheduler skeleton
-- simulation and monitoring stubs
-- Python test contract placeholders
+### 3. LLM Server Functions (Node 1)
+- `getLLMAnswer(requestId, query, context)` -> `getLLMAnswerResponse(requestId, answer)`
+  - Handles customer support queries (e.g., "How to cancel a booking?", "What seats are available?").
 
-## Completion Checklist
+---
 
-- [ ] repo initialized
-- [ ] architecture documented
-- [ ] Python package structure created
-- [ ] shared domain models defined
-- [ ] coordination and scheduler skeletons created
-- [ ] simulation and monitoring placeholders created
-- [ ] work split agreed
-- [ ] milestone 1 summary prepared
+## Milestone 1 Deliverables Checklist
 
-## Next Milestones
+- [x] **gRPC Service Definitions**: `proto/ticket_service.proto` with `TicketClientService`, `TicketAppService`, and `LLMService`.
+- [x] **Client-Server Communication**: gRPC stubs generated and verified.
+- [x] **Authentication & Sessions**: Token-based authentication in `TicketClientServicer`.
+- [x] **Real-time Seat Reservation with Concurrency Control**: Thread-safe mutex in `BookingService` preventing race conditions.
+- [x] **Mock Payment Processing**: Instant payment verification in booking workflow.
+- [x] **LLM Integration**: Node 1 independent server with domain-specific FAQ responses and local Ollama support.
+- [x] **Concurrent Client Simulation**: Multi-threaded client test proving zero overbooking under high concurrency.
+- [x] **Full Automated Test Suite**: 12 passing unit and integration tests.
 
-- Milestone 2: verify concurrency and booking consistency
-- Milestone 3: implement stronger distributed coordination and failure handling
-- Milestone 4: final integration and evaluation
+---
+
+## Next Milestone (Deferred to Milestone 2)
+
+- **Milestone 2: Raft Consensus & Fault Tolerance**
+  - Leader election mechanism
+  - Booking state replication across nodes using Raft
+  - Strong consistency and failure detection (demo consistency after leader node kill)
+
