@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [LLM
 logger = logging.getLogger(__name__)
 
 
-def serve(port=50052, model_name="llama3.2"):
+def serve(port=50052, model_name="Qwen/Qwen2.5-0.5B-Instruct"):
     llm_service = DomainLLM(model_name=model_name)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
 
@@ -35,7 +35,7 @@ def serve(port=50052, model_name="llama3.2"):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=50052)
-    parser.add_argument("--model", type=str, default="llama3.2")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     args = parser.parse_args()
 
     serve(port=args.port, model_name=args.model)

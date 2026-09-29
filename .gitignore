@@ -69,3 +69,8 @@ venv.bak/
 .vscode/
 .idea/
 *.pyc
+
+# Ignore all markdown files except README.md
+docs/*.md
+*.md
+!README.md
