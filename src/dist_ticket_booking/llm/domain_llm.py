@@ -121,59 +121,66 @@ class DomainLLM:
         self._load_model()
         self._start_worker()
 
-    # ------------------------------------------------------------------
     # Model loading — offline-first
-    # ------------------------------------------------------------------
 
     def _load_model(self):
         try:
+            import warnings
             import torch
-            from transformers import pipeline as hf_pipeline
+            from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+            from transformers.utils import logging as hf_logging
 
-            # Attempt 1: local cache only (no network required)
+            # Suppress all noisy deprecation/generation warnings from transformers
+            warnings.filterwarnings("ignore")
+            hf_logging.set_verbosity_error()
+
+            logger.info(f"Loading '{self.model_name}' from local cache (offline mode)...")
             try:
-                logger.info(
-                    f"Loading '{self.model_name}' from local cache (offline mode)..."
-                )
-                self._pipeline = hf_pipeline(
-                    "text-generation",
-                    model=self.model_name,
-                    device="cpu",
-                    torch_dtype=torch.float32,
+                tokenizer = AutoTokenizer.from_pretrained(
+                    self.model_name,
                     local_files_only=True,
+                    clean_up_tokenization_spaces=False,
                 )
-                logger.info("Model loaded from local cache.")
-                return
+                model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name,
+                    local_files_only=True,
+                    dtype=torch.float32,
+                )
             except Exception:
-                pass
+                logger.info(
+                    f"Local cache miss for '{self.model_name}'. "
+                    "Downloading model (first run only)..."
+                )
+                tokenizer = AutoTokenizer.from_pretrained(
+                    self.model_name,
+                    local_files_only=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name,
+                    local_files_only=False,
+                    dtype=torch.float32,
+                )
 
-            # Attempt 2: download once and cache locally for future runs
-            logger.info(
-                f"Local cache miss for '{self.model_name}'. "
-                "Downloading model (internet required for this first run only)..."
-            )
-            self._pipeline = hf_pipeline(
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token_id = tokenizer.eos_token_id
+
+            self._pipeline = pipeline(
                 "text-generation",
-                model=self.model_name,
+                model=model,
+                tokenizer=tokenizer,
                 device="cpu",
-                torch_dtype=torch.float32,
-                local_files_only=False,
             )
-            logger.info(
-                f"Model '{self.model_name}' downloaded and cached. "
-                "Subsequent starts will be fully offline."
-            )
+            logger.info(f"Model '{self.model_name}' loaded successfully.")
 
         except Exception as exc:
             logger.warning(
                 f"Could not load model '{self.model_name}': {exc}. "
-                "All queries will use the keyword fallback."
+                "All queries will use keyword fallback."
             )
             self._pipeline = None
 
-    # ------------------------------------------------------------------
     # Worker thread — batched inference
-    # ------------------------------------------------------------------
 
     def _start_worker(self):
         t = threading.Thread(
@@ -248,9 +255,7 @@ class DomainLLM:
                 results.append(str(generated).strip())
         return results
 
-    # ------------------------------------------------------------------
     # Public interface
-    # ------------------------------------------------------------------
 
     def generate_recommendation(self, prompt: str) -> dict:
         """Submit a prompt and block until the worker returns the answer."""
