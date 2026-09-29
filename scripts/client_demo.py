@@ -21,32 +21,32 @@ def run(host="localhost", port=50051):
             return
         logger.info(f"Logged in successfully. Session token: {token[:8]}...")
 
-        # check initial seat availability
-        avail_res = client.get(token, "availability", {"ticket_id": "SEAT-A1"})
+        # check initial slot availability
+        avail_res = client.get(token, "availability", {"ticket_id": "SLOT-CVS-D1-110001"})
         for item in avail_res.items:
             logger.info(f"Availability for {item.id}: {item.data}")
 
         # query support chatbot
-        for query in ["How to cancel a booking?", "What seats are available?"]:
+        for query in ["How to cancel a booking?", "What documents do I need?"]:
             logger.info(f"FAQ question: {query}")
             faq_res = client.get(token, "faq", {"query": query})
             for item in faq_res.items:
                 logger.info(f"Answer: {item.data}")
 
-        # reserve a seat
-        booking_payload = {"ticket_id": "SEAT-A1", "quantity": 1, "priority": 1}
+        # reserve a vaccine slot
+        booking_payload = {"ticket_id": "SLOT-CVS-D1-110001", "quantity": 1, "priority": 1}
         post_res = client.post(token, "booking", booking_payload)
         logger.info(f"Booking status: {post_res.status} ({post_res.message})")
 
         # check updated availability
-        updated = client.get(token, "availability", {"ticket_id": "SEAT-A1"})
+        updated = client.get(token, "availability", {"ticket_id": "SLOT-CVS-D1-110001"})
         for item in updated.items:
             logger.info(f"Updated availability: {item.data}")
 
         # test business request directly
         biz_res = client.process_business_request(
             request_id="req-test-1",
-            payload={"action": "booking", "user_id": "alice", "ticket_id": "SEAT-A1", "quantity": 1},
+            payload={"action": "booking", "user_id": "alice", "ticket_id": "SLOT-CVX-D1-400001", "quantity": 1},
         )
         logger.info(f"Business request status: {biz_res.status} ({biz_res.message})")
 

@@ -1,6 +1,6 @@
 """Tests for the business logic and gRPC-ready service contracts."""
 
-from dist_ticket_booking.business.booking_service import BookingService, VaccinationService
+from dist_ticket_booking.business.booking_service import BookingService, VaccinationService, _get_field
 from dist_ticket_booking.core.models import VaccineSlot, Ticket
 from dist_ticket_booking.grpc.service import TicketServiceStub
 from dist_ticket_booking.llm.domain_llm import DomainLLM
@@ -47,7 +47,8 @@ def test_booking_service_updates_inventory_after_acceptance():
     response = service.create_booking("U-001", "SLOT-CVS-D1-TEST", 1)
 
     assert response["status"] == "accepted"
-    assert service.ticket_store["SLOT-CVS-D1-TEST"].available_count == 9
+    slot = service.ticket_store["SLOT-CVS-D1-TEST"]
+    assert _get_field(slot, "available_count") == 9
     assert response["updated_availability"] == 9
 
 
@@ -81,3 +82,44 @@ def test_llm_stub_contract_is_present():
     # If model not loaded, status will be "error" but response will still be a non-empty string
     assert isinstance(result["response"], str)
     assert len(result["response"]) > 0
+
+
+def test_dispatcher_queues_and_dequeues_in_order():
+    from dist_ticket_booking.scheduler.dispatcher import Dispatcher
+    from dist_ticket_booking.core.models import SlotBookingRequest
+
+    d = Dispatcher()
+    r1 = SlotBookingRequest("req-1", "user-a", "SLOT-001", 1, priority=0)
+    r2 = SlotBookingRequest("req-2", "user-b", "SLOT-001", 1, priority=1)
+
+    d.enqueue(r1)
+    d.enqueue(r2)
+
+    assert d.size() == 2
+    first = d.next_request()
+    assert first.request_id == "req-1"
+    assert d.size() == 1
+
+
+def test_lock_manager_serializes_contenders():
+    from dist_ticket_booking.coordination.lock_manager import LockManager
+
+    lm = LockManager()
+    r1 = lm.acquire("process-A")
+    r2 = lm.acquire("process-B")
+    released = lm.release("process-A")
+
+    assert r1["status"] == "acquired"
+    assert r2["status"] == "queued"
+    assert released["next_owner"] == "process-B"
+
+
+def test_booking_service_uses_dispatcher_and_lock_manager():
+    service = VaccinationService(_slot_store())
+
+    result = service.create_booking("U-002", "SLOT-CVS-D1-TEST", 2)
+
+    assert result["status"] == "accepted"
+    # After booking 2 of 10, dispatcher queue should be empty (request consumed)
+    assert service.dispatcher.size() == 0
+

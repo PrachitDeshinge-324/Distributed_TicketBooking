@@ -17,18 +17,6 @@ class VaccineSlot:
     price: float = 0.0         # 0 for govt centers, ~250 for private
     status: str = "available"
 
-    @property
-    def name(self) -> str:
-        return f"{self.vaccine_name} Dose {self.dose_number} — {self.center_name}"
-
-    @property
-    def category(self) -> str:
-        return self.vaccine_name
-
-    @property
-    def ticket_id(self) -> str:
-        return self.slot_id
-
 
 Ticket = VaccineSlot
 
@@ -42,10 +30,6 @@ class SlotBookingRequest:
     slot_id: str               # Which VaccineSlot to book
     quantity: int = 1          # Usually 1 (one person per appointment)
     priority: int = 0          # Higher = higher priority (e.g. healthcare workers)
-
-    @property
-    def ticket_id(self) -> str:
-        return self.slot_id
 
 
 BookingRequest = SlotBookingRequest
@@ -66,10 +50,6 @@ class Appointment:
     total_amount: float
     status: str = "confirmed"  # confirmed | cancelled
     created_by: Optional[str] = None
-
-    @property
-    def ticket_id(self) -> str:
-        return self.slot_id
 
 
 Booking = Appointment

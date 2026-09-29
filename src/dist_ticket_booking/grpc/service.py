@@ -91,7 +91,8 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
             elif request.type == "faq":
                 params = json.loads(request.params) if request.params else {}
                 query = params.get("query", request.params or "")
-                answer = self._query_llm(query)
+                live_context = self._build_live_context(query)
+                answer = self._query_llm(query, live_context)
                 items = [ticket_service_pb2.DataItem(id="faq_answer", data=answer)]
                 return ticket_service_pb2.GetResponse(status="success", items=items)
 
@@ -100,20 +101,56 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
             logger.error(f"Get error: {e}")
             return ticket_service_pb2.GetResponse(status="error")
 
-    def _query_llm(self, query: str) -> str:
+    # Keywords that indicate the user is asking about live inventory
+    _AVAILABILITY_KEYWORDS = (
+        "available", "availability", "seat", "slot", "how many",
+        "remaining", "left", "count", "vacant", "open", "book",
+    )
+
+    def _build_live_context(self, query: str) -> str:
+        """Return a plain-text summary of live slot inventory if the query
+        seems to be about availability; otherwise return an empty string.
+        The summary is injected as context into the LLM prompt so the model
+        can answer with real numbers instead of generic advice.
+        """
+        q = query.lower()
+        if not any(kw in q for kw in self._AVAILABILITY_KEYWORDS):
+            return ""
+
+        all_slots = self.booking_service.get_availability()
+        tickets = all_slots.get("tickets", {})
+        if not tickets:
+            return ""
+
+        lines = ["Current live slot availability:"]
+        for slot_id, info in tickets.items():
+            count = info.get("available_count", 0)
+            name = info.get("name", slot_id)
+            date = info.get("date", "")
+            center = info.get("center_name", "")
+            price = info.get("price", 0.0)
+            price_str = "Free" if price == 0.0 else f"Rs. {price:.0f}"
+            status = "available" if count > 0 else "sold out"
+            lines.append(
+                f"- {name}: {count} slot(s) {status} | Date: {date} | "
+                f"Center: {center} | {price_str}"
+            )
+        return "\n".join(lines)
+
+    def _query_llm(self, query: str, context: str = "") -> str:
         if self.llm_stub:
             try:
                 req = ticket_service_pb2.LLMQueryRequest(
                     request_id=str(uuid.uuid4()),
                     query=query,
-                    context="TicketClientFAQ",
+                    context=context or "TicketClientFAQ",
                 )
                 res = self.llm_stub.GetLLMAnswer(req)
                 return res.answer
             except Exception as e:
                 logger.warning(f"Could not reach LLM server: {e}")
         if self.llm_service:
-            res = self.llm_service.get_llm_answer(str(uuid.uuid4()), query)
+            res = self.llm_service.get_llm_answer(str(uuid.uuid4()), query, context)
             return res.get("answer", "")
         return "Service unavailable"
 
