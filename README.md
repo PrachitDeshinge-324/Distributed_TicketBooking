@@ -100,7 +100,7 @@ From the live run shown above (MacBook Air, CPU):
 | 10 concurrent clients, slot with 3 available | 3 accepted, 7 rejected, 0 errors, remaining 0 (12 ms) |
 | Overbooking | None (`Concurrency test PASSED`) |
 | LLM FAQ latency | About 12 s per answer on CPU |
-| Unit tests | 13 / 13 passing |
+| Tests | 13 / 13 passing |
 | gRPC integration tests | 2 / 2 passing |
 
 Small models can drift from the prompt rules. In the demo run the cancellation answer did not cite the 24-hour rule, and the documents answer added a medical-certificate requirement that is not in the rules. See [Known limitations](#known-limitations).
