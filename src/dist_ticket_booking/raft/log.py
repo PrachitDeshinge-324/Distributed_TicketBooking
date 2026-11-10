@@ -65,6 +65,7 @@ class RaftLog:
         self._snapshot_path = os.path.join(data_dir, f"{node_id}_snapshot.json")
         self.last_included_index: int = -1
         self.last_included_term: int = 0
+        self.snapshot: Optional[dict] = None  # in-memory copy of the latest snapshot
         self._load()
 
     def append(self, entry: LogEntry) -> int:
@@ -96,6 +97,22 @@ class RaftLog:
                 return self._entries[-1].term
             return self.last_included_term
 
+    def term_at(self, index: int) -> Optional[int]:
+        """Term of the entry at `index`, including the snapshot boundary.
+
+        Returns None if the index is neither in the log nor the last
+        compacted index (i.e. unknown to this node).
+        """
+        if index < 0:
+            return 0
+        with self._lock:
+            if index == self.last_included_index:
+                return self.last_included_term
+            for e in self._entries:
+                if e.index == index:
+                    return e.term
+            return None
+
     def slice_from(self, start_index: int) -> List[LogEntry]:
         """Return entries from start_index onwards (inclusive)."""
         with self._lock:
@@ -125,6 +142,7 @@ class RaftLog:
                     json.dump(snapshot_content, f)
                 self.last_included_index = last_included_index
                 self.last_included_term = last_included_term
+                self.snapshot = snapshot_content
 
                 # Discard compacted entries
                 self._entries = [e for e in self._entries if e.index > last_included_index]
@@ -136,6 +154,23 @@ class RaftLog:
             except OSError as e:
                 logger.error(f"Failed to create snapshot: {e}")
 
+    def install_snapshot(self, last_included_index: int, last_included_term: int, state_data: dict):
+        """Install a snapshot received from the leader (InstallSnapshot RPC).
+
+        If the log already has an entry matching the snapshot's last index and
+        term, the entries after it are kept; otherwise the whole log is
+        discarded (Raft paper, Figure 13, steps 6-7).
+        """
+        with self._lock:
+            keep_suffix = any(
+                e.index == last_included_index and e.term == last_included_term for e in self._entries
+            )
+        self.create_snapshot(last_included_index, last_included_term, state_data)
+        if not keep_suffix:
+            with self._lock:
+                self._entries = []
+                self._persist()
+
     def load_snapshot(self) -> Optional[dict]:
         """Load snapshot file from disk if present."""
         if not os.path.exists(self._snapshot_path):
@@ -145,6 +180,7 @@ class RaftLog:
                 data = json.load(f)
             self.last_included_index = data.get("last_included_index", -1)
             self.last_included_term = data.get("last_included_term", 0)
+            self.snapshot = data
             return data
         except (OSError, json.JSONDecodeError) as e:
             logger.error(f"Failed to load snapshot from {self._snapshot_path}: {e}")

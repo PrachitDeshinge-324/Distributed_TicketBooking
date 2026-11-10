@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 
 class RaftServiceServicer(ticket_service_pb2_grpc.RaftServiceServicer):
-    """gRPC servicer handling RequestVote and AppendEntries RPCs between nodes."""
+    """gRPC servicer handling RequestVote, AppendEntries and InstallSnapshot RPCs between nodes."""
 
     def __init__(self, raft_node: RaftNode):
         self.raft_node = raft_node
@@ -24,4 +24,11 @@ class RaftServiceServicer(ticket_service_pb2_grpc.RaftServiceServicer):
             return self.raft_node.handle_append_entries(request)
         except Exception as e:
             logger.error(f"Error handling AppendEntries from {request.from_node}: {e}")
+            raise
+
+    def InstallSnapshot(self, request, context):
+        try:
+            return self.raft_node.handle_install_snapshot(request)
+        except Exception as e:
+            logger.error(f"Error handling InstallSnapshot from {request.from_node}: {e}")
             raise

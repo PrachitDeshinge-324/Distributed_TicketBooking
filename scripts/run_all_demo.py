@@ -3,7 +3,6 @@ import argparse
 import os
 import subprocess
 import sys
-import time
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, PROJECT_ROOT)
@@ -26,7 +25,7 @@ def run_command(cmd, desc):
 def main():
     parser = argparse.ArgumentParser(description="Run complete Distributed Ticket Booking demonstrations")
     parser.add_argument("--skip-tests", action="store_true", help="Skip pytest test suite")
-    parser.add_argument("--demo-only", type=str, choices=["raft", "fault-tolerance", "verify"], help="Run a specific demo only")
+    parser.add_argument("--demo-only", type=str, choices=["raft", "fault-tolerance", "verify", "full"], help="Run a specific demo only")
     args = parser.parse_args()
 
     print("\n" + "#" * 70)
@@ -49,6 +48,10 @@ def main():
         run_command(["scripts/demo_fault_tolerance.py"], "Fault Tolerance, Leader Crash & Recovery Demo")
         return
 
+    if args.demo_only == "full":
+        ok = run_command(["scripts/demo_full_system.py"], "Full 5-Node System Demo (LLM + 3 Raft + client node)")
+        sys.exit(0 if ok else 1)
+
     if args.demo_only == "verify":
         ok = run_command(["scripts/verify_milestone2.py"], "End-to-End Milestone 2 Verification")
         sys.exit(0 if ok else 1)
@@ -63,12 +66,16 @@ def main():
     print("\n>>> Phase 4: End-to-End Verification (LLM, quorum loss, full restart, 5 nodes)...")
     ok3 = run_command(["scripts/verify_milestone2.py"], "End-to-End Milestone 2 Verification")
 
-    all_ok = ok1 and ok2 and ok3
+    print("\n>>> Phase 5: Full 5-Node System (LLM + 3 Raft nodes + client node, leader kill under load)...")
+    ok4 = run_command(["scripts/demo_full_system.py"], "Full 5-Node System Demo")
+
+    all_ok = ok1 and ok2 and ok3 and ok4
     print("\n" + "#" * 70)
     if all_ok:
         print("  ALL DEMONSTRATIONS AND VERIFICATIONS COMPLETED SUCCESSFULLY!")
     else:
-        failed = [n for n, ok in (("raft demo", ok1), ("fault-tolerance demo", ok2), ("verification", ok3)) if not ok]
+        failed = [n for n, ok in (("raft demo", ok1), ("fault-tolerance demo", ok2),
+                                                    ("verification", ok3), ("full-system demo", ok4)) if not ok]
         print(f"  SOME STEPS FAILED: {', '.join(failed)}")
     print("#" * 70 + "\n")
     sys.exit(0 if all_ok else 1)

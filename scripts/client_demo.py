@@ -1,5 +1,4 @@
 """Sample client workflow to test the booking service endpoints."""
-import json
 import logging
 import sys
 

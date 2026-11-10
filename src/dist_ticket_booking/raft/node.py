@@ -72,6 +72,11 @@ class RaftNode:
         # Last time (monotonic) each peer acknowledged us in our current term.
         # Used for fail-fast quorum checks ("CheckQuorum").
         self._last_ack: Dict[str, float] = {}
+        # Index of the no-op entry appended when we became leader; reads are
+        # served only once it is committed (Raft paper, section 8).
+        self._noop_index: int = -1
+        # Highest commit index persisted to disk (lower bound on true commits).
+        self._persisted_commit: int = -1
 
         # ── State machine ──
         self.state_machine = StateMachine(booking_service)
@@ -152,12 +157,15 @@ class RaftNode:
                 f"[{self.node_id}] Restored state machine from snapshot up to index {self.state_machine.last_applied}"
             )
 
-        last_idx = self.log.last_index()
-        if last_idx > self.commit_index:
-            self.commit_index = last_idx
+        # Replay only entries known to be committed. Entries after that may be
+        # uncommitted leftovers that a new leader will overwrite; they are
+        # applied later, once the leader's commit index covers them.
+        known_committed = min(self._persisted_commit, self.log.last_index())
+        if known_committed > self.commit_index:
+            self.commit_index = known_committed
             self._apply_committed_entries()
             logger.info(
-                f"[{self.node_id}] Replayed log entries up to index {last_idx}. "
+                f"[{self.node_id}] Replayed committed log entries up to index {known_committed}. "
                 f"State machine now at index {self.state_machine.last_applied}"
             )
 
@@ -167,12 +175,25 @@ class RaftNode:
             if self.state_machine.last_applied < 0:
                 return False
             applied_idx = self.state_machine.last_applied
-            entry = self.log.get(applied_idx)
-            term = entry.term if entry else self.current_term
-            data = self.state_machine.get_snapshot_data()
+            if applied_idx <= self.log.last_included_index:
+                return False  # nothing new to compact
+            term = self.log.term_at(applied_idx)
+            if term is None:
+                term = self.current_term
+            # Deep, point-in-time copy: the snapshot must not share mutable
+            # objects (e.g. booking records) with the live state machine, or
+            # later changes would leak into a snapshot labelled with an older
+            # index and corrupt any follower that installs it.
+            data = json.loads(json.dumps(self.state_machine.get_snapshot_data()))
             self.log.create_snapshot(applied_idx, term, data)
             logger.info(f"[{self.node_id}] Successfully took snapshot at index {applied_idx} (term {term})")
             return True
+
+    def _maybe_snapshot(self):
+        """Compact the log once it exceeds the configured threshold. Under self._lock."""
+        threshold = self.config.snapshot_threshold
+        if threshold > 0 and len(self.log) >= threshold:
+            self.take_snapshot()
 
     # ================================================================
     #  PERSISTENCE (currentTerm + votedFor)
@@ -184,6 +205,10 @@ class RaftNode:
             data = {
                 "current_term": self.current_term,
                 "voted_for": self.voted_for,
+                # Not required by Raft, but lets a restarted node rebuild its
+                # in-memory state machine up to entries known to be committed
+                # (and never beyond: uncommitted entries may be overwritten).
+                "commit_index": self._persisted_commit,
             }
             with open(self._state_path, "w") as f:
                 json.dump(data, f)
@@ -199,6 +224,7 @@ class RaftNode:
                 data = json.load(f)
             self.current_term = data.get("current_term", 0)
             self.voted_for = data.get("voted_for")
+            self._persisted_commit = data.get("commit_index", -1)
             logger.info(
                 f"[{self.node_id}] Loaded persistent state: "
                 f"term={self.current_term}, votedFor={self.voted_for}"
@@ -347,6 +373,22 @@ class RaftNode:
             f"(log_len={len(self.log)})"
         )
 
+        # Append a no-op in our own term. A leader may only commit entries from
+        # its current term directly; committing this no-op also commits every
+        # earlier entry, so recovered state becomes visible without waiting for
+        # the next client write (Raft paper, sections 5.4.2 and 8).
+        noop = LogEntry(
+            term=self.current_term,
+            index=self.log.last_index() + 1,
+            command_type="noop",
+            command={},
+        )
+        self.log.append(noop)
+        self._noop_index = noop.index
+        if self.config.cluster_size == 1:
+            self.commit_index = noop.index
+            self._apply_committed_entries()
+
         self._start_heartbeat()
         self._send_append_entries_to_all()
 
@@ -356,9 +398,12 @@ class RaftNode:
         Must be called under self._lock.
         """
         was_leader = self.state == NodeState.LEADER
-        self.current_term = new_term
+        if new_term > self.current_term:
+            # Only a new term resets our vote; clearing it within the same term
+            # would let this node vote twice and allow two leaders per term.
+            self.current_term = new_term
+            self.voted_for = None
         self.state = NodeState.FOLLOWER
-        self.voted_for = None
         self._persist_state()
 
         if was_leader:
@@ -422,15 +467,22 @@ class RaftNode:
                 return
 
             next_idx = self.next_index.get(peer_id, 0)
-            prev_index = next_idx - 1
-            prev_entry = self.log.get(prev_index)
-            prev_term = prev_entry.term if prev_entry else 0
-            entries = self.log.slice_from(next_idx)
+            if next_idx <= self.log.last_included_index:
+                # The entries this follower needs were compacted: ship the snapshot.
+                send_snapshot = True
+            else:
+                send_snapshot = False
+                prev_index = next_idx - 1
+                prev_term = self.log.term_at(prev_index) or 0
+                entries = self.log.slice_from(next_idx)
             term = self.current_term
             commit = self.commit_index
 
         stub = self._peer_stubs.get(peer_id)
         if not stub:
+            return
+        if send_snapshot:
+            self._send_install_snapshot(peer_id, stub)
             return
 
         try:
@@ -462,10 +514,48 @@ class RaftNode:
                         self.next_index[peer_id] = response.match_index + 1
                     self._try_advance_commit_index()
                 else:
-                    # Log inconsistency: decrement next_index and retry
-                    self.next_index[peer_id] = max(0, self.next_index[peer_id] - 1)
+                    # Log inconsistency: back up. The follower reports its last
+                    # index, so jump straight past entries it cannot have.
+                    self.next_index[peer_id] = max(
+                        0, min(self.next_index[peer_id] - 1, response.match_index + 1)
+                    )
         except Exception as e:
             logger.debug(f"[{self.node_id}] AppendEntries to {peer_id} failed: {e}")
+
+    def _send_install_snapshot(self, peer_id: str, stub):
+        """Send the leader's snapshot to a follower that is behind the compacted log."""
+        with self._lock:
+            if self.state != NodeState.LEADER or not self.log.snapshot:
+                return
+            snap = self.log.snapshot
+            term = self.current_term
+            request = ticket_service_pb2.InstallSnapshotRequest(
+                from_node=self.node_id,
+                to_node=peer_id,
+                term=term,
+                last_included_index=snap["last_included_index"],
+                last_included_term=snap["last_included_term"],
+                data=json.dumps(snap["state"]),
+            )
+        try:
+            response = stub.InstallSnapshot(request, timeout=2.0)
+        except Exception as e:
+            logger.debug(f"[{self.node_id}] InstallSnapshot to {peer_id} failed: {e}")
+            return
+        with self._lock:
+            if response.term > self.current_term:
+                self._step_down(response.term)
+                return
+            if self.state != NodeState.LEADER:
+                return
+            self._last_ack[peer_id] = time.monotonic()
+            if response.success:
+                self.match_index[peer_id] = max(self.match_index.get(peer_id, -1), response.match_index)
+                self.next_index[peer_id] = self.match_index[peer_id] + 1
+                logger.info(
+                    f"[{self.node_id}] Installed snapshot on {peer_id} up to index {response.match_index}"
+                )
+                self._try_advance_commit_index()
 
     def _try_advance_commit_index(self):
         """Check if any new entries can be committed (majority replicated).
@@ -507,6 +597,11 @@ class RaftNode:
                 pending = self._pending_requests.pop(next_index)
                 pending.result = result
                 pending.event.set()
+
+        if self.commit_index > self._persisted_commit:
+            self._persisted_commit = self.commit_index
+            self._persist_state()
+        self._maybe_snapshot()
 
     # ================================================================
     #  RPC HANDLERS (called by RaftServiceServicer)
@@ -567,10 +662,11 @@ class RaftNode:
             self.leader_id = request.from_node
             self._reset_election_timer()
 
-            # Log consistency check
-            if request.prev_log_index >= 0:
-                prev_entry = self.log.get(request.prev_log_index)
-                if prev_entry is None or prev_entry.term != request.prev_log_term:
+            # Log consistency check (snapshot-aware: anything at or below the
+            # snapshot boundary is committed and therefore matches).
+            if request.prev_log_index > self.log.last_included_index:
+                prev_term = self.log.term_at(request.prev_log_index)
+                if prev_term is None or prev_term != request.prev_log_term:
                     return ticket_service_pb2.AppendEntriesResponse(
                         from_node=self.node_id,
                         to_node=request.from_node,
@@ -582,15 +678,23 @@ class RaftNode:
             # Append new entries (handling conflict truncations)
             for proto_entry in request.entries:
                 entry = LogEntry.from_proto(proto_entry)
+                if entry.index <= self.log.last_included_index:
+                    continue  # already covered by our snapshot
                 existing = self.log.get(entry.index)
                 if existing and existing.term != entry.term:
                     self.log.truncate_from(entry.index)
                 if not self.log.get(entry.index):
                     self.log.append(entry)
 
+            # Index of the last entry this RPC vouches for. Using our own
+            # last_index() here would be unsafe: stale entries from an old
+            # term beyond the leader's range could be counted (or applied)
+            # as if they matched the leader's log (Raft Figure 2, rule 5).
+            last_new_index = max(request.prev_log_index + len(request.entries), self.log.last_included_index)
+
             # Update commit index
             if request.commit_index > self.commit_index:
-                self.commit_index = min(request.commit_index, self.log.last_index())
+                self.commit_index = min(request.commit_index, last_new_index)
                 self._apply_committed_entries()
 
             return ticket_service_pb2.AppendEntriesResponse(
@@ -598,12 +702,63 @@ class RaftNode:
                 to_node=request.from_node,
                 term=self.current_term,
                 entry_appended=True,
-                match_index=self.log.last_index(),
+                match_index=last_new_index,
             )
+
+    def handle_install_snapshot(self, request) -> ticket_service_pb2.InstallSnapshotResponse:
+        """Handle InstallSnapshot RPC from the leader (Raft paper, Figure 13)."""
+        with self._lock:
+            def reply(success: bool):
+                return ticket_service_pb2.InstallSnapshotResponse(
+                    from_node=self.node_id,
+                    to_node=request.from_node,
+                    term=self.current_term,
+                    success=success,
+                    match_index=max(self.log.last_included_index, self.state_machine.last_applied),
+                )
+
+            if request.term < self.current_term:
+                return reply(False)
+            if request.term > self.current_term or self.state != NodeState.FOLLOWER:
+                self._step_down(request.term)
+            self.leader_id = request.from_node
+            self._reset_election_timer()
+
+            if request.last_included_index <= self.state_machine.last_applied:
+                return reply(True)  # we already have everything in this snapshot
+
+            state = json.loads(request.data)
+            self.log.install_snapshot(request.last_included_index, request.last_included_term, state)
+            self.state_machine.restore_from_snapshot(state)
+            self.state_machine.last_applied = request.last_included_index
+            self.commit_index = max(self.commit_index, request.last_included_index)
+            logger.info(
+                f"[{self.node_id}] Installed snapshot from {request.from_node} "
+                f"up to index {request.last_included_index}"
+            )
+            self._apply_committed_entries()
+            return reply(True)
 
     # ================================================================
     #  CLIENT REQUEST INTERFACE
     # ================================================================
+
+    def wait_until_ready_for_reads(self, timeout: float = 3.0) -> bool:
+        """Block until this leader has committed its term's no-op entry.
+
+        Before that, a new leader might not yet know about entries committed
+        by its predecessor, so serving reads could return stale data.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                if self.state != NodeState.LEADER:
+                    return False
+                if self.commit_index >= self._noop_index:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
 
     def has_quorum_contact(self) -> bool:
         """True if a majority (including self) acked us within the election timeout.
@@ -698,4 +853,5 @@ class RaftNode:
                 "last_applied": self.state_machine.last_applied,
                 "log_length": len(self.log),
                 "voted_for": self.voted_for,
+                "state_digest": self.state_machine.digest(),
             }

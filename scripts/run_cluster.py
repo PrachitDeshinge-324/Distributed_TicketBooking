@@ -44,8 +44,10 @@ class ClusterManager:
         data_dir: str = "./raft_data",
         with_llm: bool = False,
         llm_port: int = 50060,
+        node_args=None,
     ):
         self.python_bin = python_bin
+        self.node_args = list(node_args or [])  # extra CLI args for every run_node.py
         self.nodes_spec = nodes or DEFAULT_CLUSTER_SPEC
         self.data_dir = data_dir
         self.with_llm = with_llm
@@ -100,7 +102,7 @@ class ClusterManager:
             self.data_dir,
             "--llm-port",
             str(self.llm_port),
-        ]
+        ] + self.node_args
 
         logger.info(f"Starting node {node_id} (client:{spec['client_port']}, raft:{spec['raft_port']})...")
         proc = subprocess.Popen(cmd)
