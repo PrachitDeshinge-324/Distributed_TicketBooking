@@ -1,0 +1,14 @@
+# Distributed Ticket Booking - Python 3.10+ (tested on 3.11)
+# Install: pip install -r requirements.txt && pip install -e .
+
+# --- gRPC / protobuf (generated stubs need protobuf >= 7.35.1) ---
+grpcio==1.84.0
+grpcio-tools==1.84.0
+protobuf==7.36.2
+
+# --- Domain LLM server (Qwen/Qwen3.5-0.8B; CUDA / Apple MPS / CPU) ---
+torch==2.14.1
+transformers==5.19.0
+
+# --- Tests ---
+pytest==9.1.1

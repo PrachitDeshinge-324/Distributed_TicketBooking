@@ -6,10 +6,18 @@ set -e
 # Output directory
 OUT_DIR="src/dist_ticket_booking/grpc"
 
-PYTHON_BIN="${PYTHON:-./.venv/bin/python}"
-if [ ! -f "$PYTHON_BIN" ]; then
-    PYTHON_BIN="python3"
+PYTHON_BIN="${PYTHON}"
+if [ -z "$PYTHON_BIN" ]; then
+    if [ -f "/opt/homebrew/Caskroom/miniforge/base/envs/AOS/bin/python" ]; then
+        PYTHON_BIN="/opt/homebrew/Caskroom/miniforge/base/envs/AOS/bin/python"
+    elif [ -f "./.venv/bin/python" ]; then
+        PYTHON_BIN="./.venv/bin/python"
+    else
+        PYTHON_BIN="python3"
+    fi
 fi
+
+echo "Using Python: $PYTHON_BIN"
 
 $PYTHON_BIN -m grpc_tools.protoc \
     -I=proto \

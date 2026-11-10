@@ -1,6 +1,9 @@
 """gRPC servicers and client wrapper for ticket booking."""
 import json
 import logging
+import os
+import re
+import time
 import uuid
 from typing import Dict, Any, Optional
 
@@ -9,9 +12,33 @@ import grpc
 from . import ticket_service_pb2
 from . import ticket_service_pb2_grpc
 from dist_ticket_booking.business.booking_service import BookingService
-from dist_ticket_booking.llm.domain_llm import DomainLLM
+from dist_ticket_booking.llm.domain_llm import DomainLLM, _keyword_fallback
 
 logger = logging.getLogger(__name__)
+
+# Deadline for app-server -> LLM-server RPCs. If the model is slower than
+# this (e.g. CPU-only inference), clients get a keyword-based answer instead
+# of hanging. Override with the LLM_TIMEOUT_S environment variable.
+LLM_TIMEOUT_S = float(os.environ.get("LLM_TIMEOUT_S", "30"))
+
+
+_UNAVAILABLE_MSG = (
+    "Cluster unavailable: cannot reach a majority of nodes (no quorum). "
+    "No changes were made; please retry shortly."
+)
+
+
+def _raft_status(res: dict):
+    """Map a Raft propose() result to (status, message) for clients."""
+    status = res.get("status", "error")
+    if status == "unavailable":
+        return "unavailable", _UNAVAILABLE_MSG
+    return status, res.get("message", "")
+
+
+def _fallback_answer(query: str, context: str = "") -> str:
+    prompt = f"{query}\n\nContext: {context}" if context else query
+    return _keyword_fallback(prompt)
 
 
 class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
@@ -19,27 +46,60 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
 
     def __init__(
         self,
-        booking_service: BookingService,
-        sessions: Dict[str, str],
+        booking_service: Optional[BookingService] = None,
+        sessions: Optional[Dict[str, str]] = None,
         llm_stub: Optional[ticket_service_pb2_grpc.LLMServiceStub] = None,
         llm_service: Optional[DomainLLM] = None,
+        raft_node: Optional[Any] = None,
     ):
-        self.booking_service = booking_service
-        self.sessions = sessions
+        self.raft_node = raft_node
+        if raft_node is not None:
+            self.booking_service = raft_node.state_machine.booking_service
+            self.sessions = raft_node.state_machine.sessions
+        else:
+            self.booking_service = booking_service or BookingService()
+            self.sessions = sessions if sessions is not None else {}
         self.llm_stub = llm_stub
         self.llm_service = llm_service
 
     def _verify_token(self, token: str) -> Optional[str]:
+        if self.raft_node is not None:
+            return self.raft_node.state_machine.get_session_user(token)
         return self.sessions.get(token)
 
     def Login(self, request, context):
-        if request.username and (request.password == "password" or len(request.password) > 0):
+        if not (request.username and (request.password == "password" or len(request.password) > 0)):
+            return ticket_service_pb2.LoginResponse(status="unauthorized")
+
+        if self.raft_node is not None:
             token = str(uuid.uuid4())
-            self.sessions[token] = request.username
-            return ticket_service_pb2.LoginResponse(status="success", token=token)
-        return ticket_service_pb2.LoginResponse(status="unauthorized")
+            res = self.raft_node.propose("login", {"username": request.username, "token": token})
+            if res.get("message") == "not_leader":
+                return ticket_service_pb2.LoginResponse(
+                    status="redirect",
+                    leader_hint=res.get("leader_hint", "") or (self.raft_node.get_leader_address() or ""),
+                )
+            if res.get("status") == "success":
+                return ticket_service_pb2.LoginResponse(status="success", token=res.get("token", token))
+            status, message = _raft_status(res)
+            return ticket_service_pb2.LoginResponse(status=status, message=message)
+
+        token = str(uuid.uuid4())
+        self.sessions[token] = request.username
+        return ticket_service_pb2.LoginResponse(status="success", token=token)
 
     def Logout(self, request, context):
+        if self.raft_node is not None:
+            res = self.raft_node.propose("logout", {"token": request.token})
+            if res.get("message") == "not_leader":
+                return ticket_service_pb2.StatusResponse(
+                    status="redirect",
+                    message="not_leader",
+                    leader_hint=res.get("leader_hint", "") or (self.raft_node.get_leader_address() or ""),
+                )
+            status, message = _raft_status(res)
+            return ticket_service_pb2.StatusResponse(status=status, message=message)
+
         if request.token in self.sessions:
             del self.sessions[request.token]
             return ticket_service_pb2.StatusResponse(status="success", message="Logged out")
@@ -56,11 +116,48 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
                 ticket_id = data.get("ticket_id")
                 quantity = int(data.get("quantity", 1))
                 priority = int(data.get("priority", 0))
+
+                if self.raft_node is not None:
+                    res = self.raft_node.propose(
+                        "create_booking",
+                        {
+                            "user_id": user_id,
+                            "ticket_id": ticket_id,
+                            "quantity": quantity,
+                            "priority": priority,
+                        },
+                    )
+                    if res.get("message") == "not_leader":
+                        return ticket_service_pb2.StatusResponse(
+                            status="redirect",
+                            message="not_leader",
+                            leader_hint=res.get("leader_hint", "") or (self.raft_node.get_leader_address() or ""),
+                        )
+                    status, message = _raft_status(res)
+                    return ticket_service_pb2.StatusResponse(status=status, message=message)
+
                 res = self.booking_service.create_booking(user_id, ticket_id, quantity, priority)
                 return ticket_service_pb2.StatusResponse(status=res["status"], message=res.get("message", ""))
 
             elif request.type == "cancel":
                 booking_id = data.get("booking_id")
+                if self.raft_node is not None:
+                    res = self.raft_node.propose(
+                        "cancel_booking",
+                        {
+                            "user_id": user_id,
+                            "booking_id": booking_id,
+                        },
+                    )
+                    if res.get("message") == "not_leader":
+                        return ticket_service_pb2.StatusResponse(
+                            status="redirect",
+                            message="not_leader",
+                            leader_hint=res.get("leader_hint", "") or (self.raft_node.get_leader_address() or ""),
+                        )
+                    status, message = _raft_status(res)
+                    return ticket_service_pb2.StatusResponse(status=status, message=message)
+
                 res = self.booking_service.cancel_booking(user_id, booking_id)
                 return ticket_service_pb2.StatusResponse(status=res["status"], message=res.get("message", ""))
 
@@ -70,6 +167,24 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
             return ticket_service_pb2.StatusResponse(status="error", message=str(e))
 
     def Get(self, request, context):
+        if request.type in ("cluster_status", "status", "health"):
+            if self.raft_node is not None:
+                status_dict = self.raft_node.get_status()
+                status_dict["leader_hint"] = self.raft_node.get_leader_address() or ""
+                return ticket_service_pb2.GetResponse(
+                    status="success",
+                    items=[ticket_service_pb2.DataItem(id=self.raft_node.node_id, data=json.dumps(status_dict))],
+                    leader_hint=status_dict["leader_hint"],
+                )
+            return ticket_service_pb2.GetResponse(
+                status="success",
+                items=[ticket_service_pb2.DataItem(id="standalone", data=json.dumps({"state": "standalone"}))],
+            )
+
+        if self.raft_node is not None and not self.raft_node.is_leader:
+            leader_hint = self.raft_node.get_leader_address() or ""
+            return ticket_service_pb2.GetResponse(status="redirect", leader_hint=leader_hint)
+
         user_id = self._verify_token(request.token)
         if not user_id:
             return ticket_service_pb2.GetResponse(status="unauthorized")
@@ -110,8 +225,6 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
     def _build_live_context(self, query: str) -> str:
         """Return a plain-text summary of live slot inventory if the query
         seems to be about availability; otherwise return an empty string.
-        The summary is injected as context into the LLM prompt so the model
-        can answer with real numbers instead of generic advice.
         """
         q = query.lower()
         if not any(kw in q for kw in self._AVAILABILITY_KEYWORDS):
@@ -122,6 +235,17 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
         if not tickets:
             return ""
 
+        # Focus the context on the slots the user asked about (vaccine, city,
+        # centre, dose) so the small model isn't distracted by unrelated rows.
+        words = {w for w in re.findall(r"[a-z0-9]+", q) if len(w) >= 4 or w.isdigit()}
+        def _haystack(info):
+            return " ".join(
+                str(info.get(k, "")) for k in ("name", "vaccine_name", "center_name", "dose_number")
+            ).lower()
+        focused = {sid: i for sid, i in tickets.items() if words & set(re.findall(r"[a-z0-9]+", _haystack(i)))}
+        if focused:
+            tickets = focused
+
         lines = ["Current live slot availability:"]
         for slot_id, info in tickets.items():
             count = info.get("available_count", 0)
@@ -129,12 +253,11 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
             date = info.get("date", "")
             center = info.get("center_name", "")
             price = info.get("price", 0.0)
-            price_str = "Free" if price == 0.0 else f"Rs. {price:.0f}"
-            status = "available" if count > 0 else "sold out"
-            lines.append(
-                f"- {name}: {count} slot(s) {status} | Date: {date} | "
-                f"Center: {center} | {price_str}"
-            )
+            price_str = "free of charge" if price == 0.0 else f"paid, Rs. {price:.0f}"
+            if count > 0:
+                lines.append(f"- {name}: {count} open slot(s) on {date}; price: {price_str}")
+            else:
+                lines.append(f"- {name}: SOLD OUT on {date}")
         return "\n".join(lines)
 
     def _query_llm(self, query: str, context: str = "") -> str:
@@ -145,14 +268,16 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
                     query=query,
                     context=context or "TicketClientFAQ",
                 )
-                res = self.llm_stub.GetLLMAnswer(req)
+                res = self.llm_stub.GetLLMAnswer(req, timeout=LLM_TIMEOUT_S)
                 return res.answer
+            except grpc.RpcError as e:
+                logger.warning(f"LLM server unavailable ({e.code().name}); using keyword fallback")
             except Exception as e:
-                logger.warning(f"Could not reach LLM server: {e}")
-        if self.llm_service:
+                logger.warning(f"LLM server error: {e}; using keyword fallback")
+        elif self.llm_service:
             res = self.llm_service.get_llm_answer(str(uuid.uuid4()), query, context)
             return res.get("answer", "")
-        return "Service unavailable"
+        return _fallback_answer(query, context)
 
 
 class TicketAppServicer(ticket_service_pb2_grpc.TicketAppServiceServicer):
@@ -160,11 +285,16 @@ class TicketAppServicer(ticket_service_pb2_grpc.TicketAppServiceServicer):
 
     def __init__(
         self,
-        booking_service: BookingService,
+        booking_service: Optional[BookingService] = None,
         llm_stub: Optional[ticket_service_pb2_grpc.LLMServiceStub] = None,
         llm_service: Optional[DomainLLM] = None,
+        raft_node: Optional[Any] = None,
     ):
-        self.booking_service = booking_service
+        self.raft_node = raft_node
+        if raft_node is not None:
+            self.booking_service = raft_node.state_machine.booking_service
+        else:
+            self.booking_service = booking_service or BookingService()
         self.llm_stub = llm_stub
         self.llm_service = llm_service
 
@@ -178,20 +308,66 @@ class TicketAppServicer(ticket_service_pb2_grpc.TicketAppServiceServicer):
                 ticket_id = payload.get("ticket_id")
                 quantity = int(payload.get("quantity", 1))
                 priority = int(payload.get("priority", 0))
+
+                if self.raft_node is not None:
+                    res = self.raft_node.propose(
+                        "create_booking",
+                        {
+                            "user_id": user_id,
+                            "ticket_id": ticket_id,
+                            "quantity": quantity,
+                            "priority": priority,
+                        },
+                    )
+                    if res.get("message") == "not_leader":
+                        return ticket_service_pb2.StatusResponse(
+                            status="redirect",
+                            message="not_leader",
+                            leader_hint=res.get("leader_hint", "") or (self.raft_node.get_leader_address() or ""),
+                        )
+                    status, message = _raft_status(res)
+                    return ticket_service_pb2.StatusResponse(status=status, message=message)
+
                 res = self.booking_service.create_booking(user_id, ticket_id, quantity, priority)
                 return ticket_service_pb2.StatusResponse(status=res["status"], message=res.get("message", ""))
 
             elif action == "cancel":
+                if self.raft_node is not None:
+                    res = self.raft_node.propose(
+                        "cancel_booking",
+                        {
+                            "user_id": payload.get("user_id"),
+                            "booking_id": payload.get("booking_id"),
+                        },
+                    )
+                    if res.get("message") == "not_leader":
+                        return ticket_service_pb2.StatusResponse(
+                            status="redirect",
+                            message="not_leader",
+                            leader_hint=res.get("leader_hint", "") or (self.raft_node.get_leader_address() or ""),
+                        )
+                    status, message = _raft_status(res)
+                    return ticket_service_pb2.StatusResponse(status=status, message=message)
+
                 res = self.booking_service.cancel_booking(payload.get("user_id"), payload.get("booking_id"))
                 return ticket_service_pb2.StatusResponse(status=res["status"], message=res.get("message", ""))
 
             elif action in ("faq", "llm"):
                 query = payload.get("query", "")
                 if self.llm_stub:
-                    llm_res = self.llm_stub.GetLLMAnswer(
-                        ticket_service_pb2.LLMQueryRequest(request_id=request.request_id, query=query, context=request.context)
-                    )
-                    return ticket_service_pb2.StatusResponse(status="success", message=llm_res.answer)
+                    try:
+                        llm_res = self.llm_stub.GetLLMAnswer(
+                            ticket_service_pb2.LLMQueryRequest(
+                                request_id=request.request_id, query=query, context=request.context
+                            ),
+                            timeout=LLM_TIMEOUT_S,
+                        )
+                        return ticket_service_pb2.StatusResponse(status="success", message=llm_res.answer)
+                    except grpc.RpcError as e:
+                        logger.warning(f"LLM server unavailable ({e.code().name}); using keyword fallback")
+                        return ticket_service_pb2.StatusResponse(
+                            status="success", message=_fallback_answer(query)
+                        )
                 elif self.llm_service:
                     ans = self.llm_service.get_llm_answer(request.request_id, query)["answer"]
                     return ticket_service_pb2.StatusResponse(status="success", message=ans)
@@ -203,7 +379,12 @@ class TicketAppServicer(ticket_service_pb2_grpc.TicketAppServiceServicer):
 
     def GetLLMAnswer(self, request, context):
         if self.llm_stub:
-            return self.llm_stub.GetLLMAnswer(request)
+            try:
+                return self.llm_stub.GetLLMAnswer(request, timeout=LLM_TIMEOUT_S)
+            except grpc.RpcError:
+                return ticket_service_pb2.GetLLMAnswerResponse(
+                    request_id=request.request_id, answer=_fallback_answer(request.query)
+                )
         if self.llm_service:
             ans = self.llm_service.get_llm_answer(request.request_id, request.query, request.context)
             return ticket_service_pb2.GetLLMAnswerResponse(request_id=request.request_id, answer=ans["answer"])
@@ -225,49 +406,115 @@ class LLMServicer(ticket_service_pb2_grpc.LLMServiceServicer):
 
 
 class TicketClient:
-    """Client interface for interacting with the ticket server."""
+    """Client interface for interacting with the ticket server with auto leader redirection.
+
+    Election-aware: while the cluster has no known leader (redirect without a
+    hint) or the node we were redirected to is unreachable, the client backs
+    off and retries, returning to its original seed address when needed.
+    Only cases where the request was definitely *not* processed are retried,
+    so a booking is never applied twice.
+    """
+
+    RETRY_BACKOFF_S = 0.3
+    MAX_RETRY_WAIT_S = 6.0  # covers an election (600-1200 ms) plus a couple of retries
 
     def __init__(self, host: str = "localhost", port: int = 50051):
-        self.target = f"{host}:{port}"
+        self.seed_target = f"{host}:{port}"
+        self.token: Optional[str] = None
+        self.channel = None
+        self._connect(self.seed_target)
+
+    def _connect(self, target: str):
+        if self.channel is not None:
+            try:
+                self.channel.close()
+            except Exception:
+                pass
+        self.target = target
+        parts = target.split(":")
+        self.host = parts[0]
+        self.port = int(parts[1]) if len(parts) > 1 else 50051
         self.channel = grpc.insecure_channel(self.target)
         self.client_stub = ticket_service_pb2_grpc.TicketClientServiceStub(self.channel)
         self.app_stub = ticket_service_pb2_grpc.TicketAppServiceStub(self.channel)
-        self.token: Optional[str] = None
+
+    def _reconnect_to_leader(self, leader_hint: str):
+        if not leader_hint or leader_hint == self.target:
+            return
+        logger.info(f"[TicketClient] Redirecting from {self.target} to leader at {leader_hint}")
+        self._connect(leader_hint)
 
     def close(self):
-        self.channel.close()
+        try:
+            self.channel.close()
+        except Exception:
+            pass
 
-    def login(self, username: str, password: str = "password"):
+    def _call(self, method: str, request, max_redirects: int = 3):
+        """Invoke a client RPC, following redirects and riding out elections."""
+        deadline = time.monotonic() + self.MAX_RETRY_WAIT_S
+        redirects = 0
+        res = None
+        while True:
+            try:
+                res = getattr(self.client_stub, method)(request)
+            except grpc.RpcError as e:
+                # Connection-level failure: request never reached a server.
+                if e.code() != grpc.StatusCode.UNAVAILABLE or time.monotonic() >= deadline:
+                    raise
+                if self.target != self.seed_target:
+                    self._connect(self.seed_target)  # leader we were sent to is gone
+                time.sleep(self.RETRY_BACKOFF_S)
+                continue
+
+            if res.status != "redirect":
+                return res
+            if res.leader_hint and res.leader_hint != self.target and redirects < max_redirects:
+                redirects += 1
+                self._reconnect_to_leader(res.leader_hint)
+                continue
+            # No leader known yet (election in progress): back off and retry.
+            if time.monotonic() >= deadline:
+                return res
+            time.sleep(self.RETRY_BACKOFF_S)
+
+    def login(self, username: str, password: str = "password", max_redirects: int = 3):
         req = ticket_service_pb2.LoginRequest(username=username, password=password)
-        res = self.client_stub.Login(req)
+        res = self._call("Login", req, max_redirects)
         if res.status == "success" and res.token:
             self.token = res.token
         return res
 
-    def logout(self, token: Optional[str] = None):
+    def logout(self, token: Optional[str] = None, max_redirects: int = 3):
         tok = token or self.token
         req = ticket_service_pb2.LogoutRequest(token=tok or "")
-        res = self.client_stub.Logout(req)
-        if tok == self.token:
+        res = self._call("Logout", req, max_redirects)
+        if tok == self.token and res.status == "success":
             self.token = None
         return res
 
-    def post(self, token: str, req_type: str, data: Any):
+    def post(self, token: str, req_type: str, data: Any, max_redirects: int = 3):
         payload = data if isinstance(data, str) else json.dumps(data)
         req = ticket_service_pb2.PostRequest(token=token, type=req_type, data=payload)
-        return self.client_stub.Post(req)
+        return self._call("Post", req, max_redirects)
 
-    def get(self, token: str, req_type: str, params: Optional[Any] = None):
+    def get(self, token: str, req_type: str, params: Optional[Any] = None, max_redirects: int = 3):
         param_str = None
         if params is not None:
             param_str = params if isinstance(params, str) else json.dumps(params)
         req = ticket_service_pb2.GetRequest(token=token, type=req_type, params=param_str)
-        return self.client_stub.Get(req)
+        return self._call("Get", req, max_redirects)
 
-    def process_business_request(self, request_id: str, payload: Any, context: str = ""):
+    def process_business_request(self, request_id: str, payload: Any, context: str = "", max_redirects: int = 3):
         payload_str = payload if isinstance(payload, str) else json.dumps(payload)
         req = ticket_service_pb2.BusinessRequest(request_id=request_id, payload=payload_str, context=context)
-        return self.app_stub.ProcessBusinessRequest(req)
+        for _ in range(max_redirects):
+            res = self.app_stub.ProcessBusinessRequest(req)
+            if res.status == "redirect" and res.leader_hint:
+                self._reconnect_to_leader(res.leader_hint)
+                continue
+            return res
+        return res
 
 
 class TicketServiceStub:
@@ -281,4 +528,3 @@ class TicketServiceStub:
 
     def get_ticket_availability(self, ticket_id: str):
         return self.booking_service.get_availability(ticket_id)
-

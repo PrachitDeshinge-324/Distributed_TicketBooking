@@ -1,19 +1,20 @@
 """Standalone LLM FAQ server."""
 import argparse
 import logging
+import os
 from concurrent import futures
 
 import grpc
 
 from dist_ticket_booking.grpc import ticket_service_pb2_grpc
 from dist_ticket_booking.grpc.service import LLMServicer
-from dist_ticket_booking.llm.domain_llm import DomainLLM
+from dist_ticket_booking.llm.domain_llm import DEFAULT_MODEL, DomainLLM
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [LLM Server] %(message)s")
+logging.basicConfig(level=getattr(logging, os.environ.get("RAFT_LOG_LEVEL", "INFO").upper(), logging.INFO), format="%(asctime)s [%(levelname)s] [LLM Server] %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def serve(port=50052, model_name="Qwen/Qwen2.5-0.5B-Instruct"):
+def serve(port=50052, model_name=DEFAULT_MODEL):
     llm_service = DomainLLM(model_name=model_name)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
 
@@ -35,7 +36,7 @@ def serve(port=50052, model_name="Qwen/Qwen2.5-0.5B-Instruct"):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=50052)
-    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
     args = parser.parse_args()
 
     serve(port=args.port, model_name=args.model)

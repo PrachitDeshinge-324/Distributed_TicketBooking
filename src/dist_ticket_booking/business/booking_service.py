@@ -190,7 +190,8 @@ class VaccinationService:
     def _process_payment(self, user_id: str, amount: float) -> bool:
         return amount >= 0.0
 
-    def create_booking(self, user_id: str, ticket_id: str, quantity: int = 1, priority: int = 0):
+    def create_booking(self, user_id: str, ticket_id: str, quantity: int = 1, priority: int = 0,
+                       booking_id: Optional[str] = None):
         """Book vaccine appointment slot(s).
 
         Acquires only the per-slot lock so bookings on other slots
@@ -246,7 +247,8 @@ class VaccinationService:
             if new_count == 0:
                 _set_field(slot, "status", "sold_out")
 
-            booking_id = f"APPT-{ticket_id[:12]}-{user_id[:6]}-{uuid.uuid4().hex[:4]}"
+            if booking_id is None:
+                booking_id = f"APPT-{ticket_id[:12]}-{user_id[:6]}-{uuid.uuid4().hex[:4]}"
             vaccine_name = _get_field(slot, "vaccine_name", "")
             center_name = _get_field(slot, "center_name", "")
             dose_number = _get_field(slot, "dose_number", 0)
