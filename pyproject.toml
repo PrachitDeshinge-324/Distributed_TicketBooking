@@ -11,8 +11,12 @@ requires-python = ">=3.10"
 dependencies = [
     "grpcio>=1.60.0",
     "grpcio-tools>=1.60.0",
-    "protobuf>=4.25.0"
+    "protobuf>=7.35.1"
 ]
+
+[project.optional-dependencies]
+llm = ["torch>=2.4", "transformers>=5.0"]
+test = ["pytest>=8"]
 authors = [{ name = "Team AOS" }]
 
 [tool.setuptools]
@@ -20,3 +24,7 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests"]
+testpaths = ["tests"]
