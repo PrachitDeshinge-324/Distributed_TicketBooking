@@ -23,6 +23,9 @@ service LLMService {
 service RaftService {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  // Log compaction (Raft paper section 7): leader ships its snapshot to a
+  // follower whose next entry has already been compacted away.
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
 }
 
 // --- Messages for Client Functions ---
@@ -53,6 +56,7 @@ message PostRequest {
   string token = 1;
   string type = 2;
   string data = 3; // JSON string containing payload (e.g. ticket_id, quantity)
+  string request_id = 4; // client-chosen id, identical across retries -> exactly-once writes
 }
 
 message GetRequest {
@@ -139,4 +143,21 @@ message AppendEntriesResponse {
   int64 term = 3;            // currentTerm, for leader to update itself
   bool entry_appended = 4;   // true if follower contained entry matching prev_log_index and prev_log_term
   int64 match_index = 5;     // highest index replicated on follower
+}
+
+message InstallSnapshotRequest {
+  string from_node = 1;            // leaderId
+  string to_node = 2;              // follower
+  int64 term = 3;                  // leader's term
+  int64 last_included_index = 4;   // snapshot replaces all entries up to and including this index
+  int64 last_included_term = 5;    // term of last_included_index
+  string data = 6;                 // JSON-serialized state machine snapshot
+}
+
+message InstallSnapshotResponse {
+  string from_node = 1;
+  string to_node = 2;
+  int64 term = 3;                  // currentTerm, for leader to update itself
+  bool success = 4;
+  int64 match_index = 5;           // follower's last_included_index after install
 }

@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from typing import Dict, Any, Optional
@@ -20,6 +21,11 @@ logger = logging.getLogger(__name__)
 # this (e.g. CPU-only inference), clients get a keyword-based answer instead
 # of hanging. Override with the LLM_TIMEOUT_S environment variable.
 LLM_TIMEOUT_S = float(os.environ.get("LLM_TIMEOUT_S", "30"))
+# At most this many FAQ queries per app node wait on the LLM at once. Extra
+# queries get the instant keyword answer, so a slow model can never tie up
+# the gRPC worker threads that bookings and availability reads need.
+LLM_MAX_INFLIGHT = int(os.environ.get("LLM_MAX_INFLIGHT", "4"))
+_llm_slots = threading.BoundedSemaphore(LLM_MAX_INFLIGHT)
 
 
 _UNAVAILABLE_MSG = (
@@ -125,6 +131,7 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
                             "ticket_id": ticket_id,
                             "quantity": quantity,
                             "priority": priority,
+                            "request_id": request.request_id,
                         },
                     )
                     if res.get("message") == "not_leader":
@@ -147,6 +154,7 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
                         {
                             "user_id": user_id,
                             "booking_id": booking_id,
+                            "request_id": request.request_id,
                         },
                     )
                     if res.get("message") == "not_leader":
@@ -184,6 +192,12 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
         if self.raft_node is not None and not self.raft_node.is_leader:
             leader_hint = self.raft_node.get_leader_address() or ""
             return ticket_service_pb2.GetResponse(status="redirect", leader_hint=leader_hint)
+        if self.raft_node is not None and not self.raft_node.wait_until_ready_for_reads():
+            # New leader still catching up (or just lost leadership): let the
+            # client retry rather than serve possibly stale data.
+            return ticket_service_pb2.GetResponse(
+                status="redirect", leader_hint=self.raft_node.get_leader_address() or ""
+            )
 
         user_id = self._verify_token(request.token)
         if not user_id:
@@ -202,6 +216,14 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
                         for tid, info in availability.get("tickets", {}).items()
                     ]
                 return ticket_service_pb2.GetResponse(status="success", items=items)
+
+            elif request.type == "my_bookings":
+                mine = [
+                    ticket_service_pb2.DataItem(id=bid, data=json.dumps(b))
+                    for bid, b in sorted(self.booking_service.bookings.items())
+                    if b.get("user_id") == user_id
+                ]
+                return ticket_service_pb2.GetResponse(status="success", items=mine)
 
             elif request.type == "faq":
                 params = json.loads(request.params) if request.params else {}
@@ -261,6 +283,17 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
         return "\n".join(lines)
 
     def _query_llm(self, query: str, context: str = "") -> str:
+        if not (self.llm_stub or self.llm_service):
+            return _fallback_answer(query, context)
+        if not _llm_slots.acquire(blocking=False):
+            logger.info("LLM busy (max in-flight reached); using keyword fallback")
+            return _fallback_answer(query, context)
+        try:
+            return self._query_llm_unthrottled(query, context)
+        finally:
+            _llm_slots.release()
+
+    def _query_llm_unthrottled(self, query: str, context: str = "") -> str:
         if self.llm_stub:
             try:
                 req = ticket_service_pb2.LLMQueryRequest(
@@ -317,6 +350,7 @@ class TicketAppServicer(ticket_service_pb2_grpc.TicketAppServiceServicer):
                             "ticket_id": ticket_id,
                             "quantity": quantity,
                             "priority": priority,
+                            "request_id": request.request_id,
                         },
                     )
                     if res.get("message") == "not_leader":
@@ -411,17 +445,34 @@ class TicketClient:
     Election-aware: while the cluster has no known leader (redirect without a
     hint) or the node we were redirected to is unreachable, the client backs
     off and retries, returning to its original seed address when needed.
-    Only cases where the request was definitely *not* processed are retried,
-    so a booking is never applied twice.
+    Writes carry a request_id that stays the same across retries and the
+    replicated state machine de-duplicates on it, so a retried booking or
+    cancel is applied exactly once even if the original reply was lost.
     """
 
     RETRY_BACKOFF_S = 0.3
     MAX_RETRY_WAIT_S = 6.0  # covers an election (600-1200 ms) plus a couple of retries
 
-    def __init__(self, host: str = "localhost", port: int = 50051):
-        self.seed_target = f"{host}:{port}"
+    def __init__(self, host: str = "localhost", port: int = 50051, seeds: Optional[list] = None):
+        """`seeds` (optional) lists other cluster nodes as "host:port"; the client
+        rotates through them if the node it is talking to becomes unreachable."""
+        first = f"{host}:{port}"
+        self.seeds = [first] + [t for t in (seeds or []) if t != first]
+        self._seed_idx = 0
+        self.seed_target = first
         self.token: Optional[str] = None
         self.channel = None
+        self._connect(self.seed_target)
+
+    @classmethod
+    def for_cluster(cls, targets: list) -> "TicketClient":
+        """Client for a cluster given as ["host:port", ...]."""
+        host, port = targets[0].rsplit(":", 1)
+        return cls(host=host, port=int(port), seeds=targets[1:])
+
+    def _next_seed(self):
+        self._seed_idx = (self._seed_idx + 1) % len(self.seeds)
+        self.seed_target = self.seeds[self._seed_idx]
         self._connect(self.seed_target)
 
     def _connect(self, target: str):
@@ -464,6 +515,8 @@ class TicketClient:
                     raise
                 if self.target != self.seed_target:
                     self._connect(self.seed_target)  # leader we were sent to is gone
+                elif len(self.seeds) > 1:
+                    self._next_seed()  # our seed node is down: try another one
                 time.sleep(self.RETRY_BACKOFF_S)
                 continue
 
@@ -493,9 +546,15 @@ class TicketClient:
             self.token = None
         return res
 
-    def post(self, token: str, req_type: str, data: Any, max_redirects: int = 3):
+    def post(self, token: str, req_type: str, data: Any, max_redirects: int = 3,
+             request_id: Optional[str] = None):
+        """Send a write. The same `request_id` is used for every retry, so the
+        cluster applies the write at most once even if a reply is lost; pass an
+        earlier id explicitly to learn the outcome of an uncertain request."""
         payload = data if isinstance(data, str) else json.dumps(data)
-        req = ticket_service_pb2.PostRequest(token=token, type=req_type, data=payload)
+        req = ticket_service_pb2.PostRequest(
+            token=token, type=req_type, data=payload, request_id=request_id or uuid.uuid4().hex
+        )
         return self._call("Post", req, max_redirects)
 
     def get(self, token: str, req_type: str, params: Optional[Any] = None, max_redirects: int = 3):

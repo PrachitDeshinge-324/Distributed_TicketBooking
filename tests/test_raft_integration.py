@@ -1,5 +1,4 @@
 """Integration tests for 3-node Raft consensus cluster."""
-import json
 import os
 import shutil
 import tempfile

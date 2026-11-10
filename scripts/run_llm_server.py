@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 def serve(port=50052, model_name=DEFAULT_MODEL):
     llm_service = DomainLLM(model_name=model_name)
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=32))
 
     ticket_service_pb2_grpc.add_LLMServiceServicer_to_server(
         LLMServicer(llm_service), server

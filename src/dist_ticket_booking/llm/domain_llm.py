@@ -25,7 +25,6 @@ import queue
 import threading
 import re
 import time
-from typing import Optional
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-0.8B"
 _MAX_NEW_TOKENS = 80

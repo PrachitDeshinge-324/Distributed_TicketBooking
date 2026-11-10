@@ -7,6 +7,8 @@ Runs a sequence of checks, each printing PASS/FAIL:
   2. Fault tolerance   - follower crash, loss of quorum (fail-fast, clear error),
                          quorum restored, full-cluster crash + recovery from disk.
   3. Five-node cluster - tolerates 2 simultaneous failures; rejoined nodes converge.
+  4. Log compaction    - leader snapshots its log; a follower that missed the
+                         compacted entries catches up via InstallSnapshot.
 
 Usage:
     python scripts/verify_milestone2.py              # all sections
@@ -125,9 +127,22 @@ def faq(port, user, query):
         c.close()
 
 
-def new_manager(spec, data_dir, with_llm):
+def new_manager(spec, data_dir, with_llm, node_args=None):
     return ClusterManager(python_bin=sys.executable, nodes=spec, data_dir=data_dir,
-                          with_llm=with_llm, llm_port=LLM_PORT)
+                          with_llm=with_llm, llm_port=LLM_PORT, node_args=node_args)
+
+
+def node_status(port):
+    """cluster_status of one node (works on followers too)."""
+    ch = grpc.insecure_channel(f"localhost:{port}")
+    try:
+        stub = ticket_service_pb2_grpc.TicketClientServiceStub(ch)
+        r = stub.Get(pb.GetRequest(token="", type="cluster_status"), timeout=2)
+        return json.loads(r.items[0].data)
+    except Exception:
+        return None
+    finally:
+        ch.close()
 
 
 # ── sections ───────────────────────────────────────────────────────────────
@@ -262,6 +277,53 @@ def section_five_nodes(data_dir):
         m.stop_all()
 
 
+def section_log_compaction(data_dir):
+    print("\n[4] Log compaction & InstallSnapshot (3 Raft nodes, snapshot every 20 entries)")
+    spec = DEFAULT_CLUSTER_SPEC
+    m = new_manager(spec, data_dir, with_llm=False, node_args=["--snapshot-threshold", "20"])
+    try:
+        m.start_all()
+        leader = wait_leader(spec)
+        check("leader elected", leader, leader and leader["node_id"])
+        lp = leader["client_port"]
+        base = availability(lp)
+        lagger = next(s for s in spec if s is not leader)
+        m.kill_node(lagger["node_id"])
+
+        # ~60 committed entries while the follower is down -> leader compacts
+        c = TicketClient(port=lp)
+        for i in range(30):
+            tok = c.login(f"snap{i}").token
+            c.logout(tok)
+        c.close()
+        st = node_status(lp)
+        check("leader compacted its log", st and st["log_length"] < 25, st and f"log_length={st['log_length']}")
+        check("booking still works after compaction", book(lp, "post-snap")[0] == "accepted")
+
+        m.start_node(lagger["node_id"])
+        deadline = time.time() + 15
+        leader_applied = lag = None
+        while time.time() < deadline:
+            leader_applied = node_status(lp)["last_applied"]
+            lag = node_status(lagger["client_port"])
+            if lag and lag["last_applied"] == leader_applied:
+                break
+            time.sleep(0.3)
+        check("lagging follower caught up via snapshot",
+              lag and lag["last_applied"] == leader_applied,
+              lag and f"follower={lag['last_applied']} leader={leader_applied}")
+
+        # The caught-up follower must hold the same data: make it the leader.
+        m.kill_node(leader["node_id"])
+        rest = [s for s in spec if s is not leader]
+        new_leader = wait_leader(rest)
+        check("state intact after failing over past the snapshot",
+              new_leader and availability(new_leader["client_port"]) == base - 1,
+              new_leader and new_leader["node_id"])
+    finally:
+        m.stop_all()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--skip-llm", action="store_true", help="skip the LLM section")
@@ -277,6 +339,7 @@ def main():
             section_llm(os.path.join(root, "llm"))
         section_fault_tolerance(os.path.join(root, "ft"))
         section_five_nodes(os.path.join(root, "five"))
+        section_log_compaction(os.path.join(root, "snap"))
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

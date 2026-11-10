@@ -36,6 +36,10 @@ class ClusterConfig:
     election_timeout_min_ms: int = 600
     election_timeout_max_ms: int = 1200
 
+    # Log compaction: take a snapshot once this many entries are in the log
+    # (0 disables automatic snapshots).
+    snapshot_threshold: int = 200
+
     # Persistence directory
     data_dir: str = "./raft_data"
 
@@ -59,6 +63,7 @@ class ClusterConfig:
         heartbeat_ms: int = 100,
         election_min_ms: int = 600,
         election_max_ms: int = 1200,
+        snapshot_threshold: int = 200,
     ) -> "ClusterConfig":
         """Parse peers from CLI format: 'node-2:localhost:50054:50053,node-3:localhost:50056:50055'
 
@@ -90,4 +95,5 @@ class ClusterConfig:
             heartbeat_interval_ms=heartbeat_ms,
             election_timeout_min_ms=election_min_ms,
             election_timeout_max_ms=election_max_ms,
+            snapshot_threshold=snapshot_threshold,
         )

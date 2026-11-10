@@ -43,14 +43,16 @@ class StatusResponse(_message.Message):
     def __init__(self, status: _Optional[str] = ..., message: _Optional[str] = ..., leader_hint: _Optional[str] = ...) -> None: ...
 
 class PostRequest(_message.Message):
-    __slots__ = ("token", "type", "data")
+    __slots__ = ("token", "type", "data", "request_id")
     TOKEN_FIELD_NUMBER: _ClassVar[int]
     TYPE_FIELD_NUMBER: _ClassVar[int]
     DATA_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     token: str
     type: str
     data: str
-    def __init__(self, token: _Optional[str] = ..., type: _Optional[str] = ..., data: _Optional[str] = ...) -> None: ...
+    request_id: str
+    def __init__(self, token: _Optional[str] = ..., type: _Optional[str] = ..., data: _Optional[str] = ..., request_id: _Optional[str] = ...) -> None: ...
 
 class GetRequest(_message.Message):
     __slots__ = ("token", "type", "params")
@@ -185,3 +187,33 @@ class AppendEntriesResponse(_message.Message):
     entry_appended: bool
     match_index: int
     def __init__(self, from_node: _Optional[str] = ..., to_node: _Optional[str] = ..., term: _Optional[int] = ..., entry_appended: _Optional[bool] = ..., match_index: _Optional[int] = ...) -> None: ...
+
+class InstallSnapshotRequest(_message.Message):
+    __slots__ = ("from_node", "to_node", "term", "last_included_index", "last_included_term", "data")
+    FROM_NODE_FIELD_NUMBER: _ClassVar[int]
+    TO_NODE_FIELD_NUMBER: _ClassVar[int]
+    TERM_FIELD_NUMBER: _ClassVar[int]
+    LAST_INCLUDED_INDEX_FIELD_NUMBER: _ClassVar[int]
+    LAST_INCLUDED_TERM_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    from_node: str
+    to_node: str
+    term: int
+    last_included_index: int
+    last_included_term: int
+    data: str
+    def __init__(self, from_node: _Optional[str] = ..., to_node: _Optional[str] = ..., term: _Optional[int] = ..., last_included_index: _Optional[int] = ..., last_included_term: _Optional[int] = ..., data: _Optional[str] = ...) -> None: ...
+
+class InstallSnapshotResponse(_message.Message):
+    __slots__ = ("from_node", "to_node", "term", "success", "match_index")
+    FROM_NODE_FIELD_NUMBER: _ClassVar[int]
+    TO_NODE_FIELD_NUMBER: _ClassVar[int]
+    TERM_FIELD_NUMBER: _ClassVar[int]
+    SUCCESS_FIELD_NUMBER: _ClassVar[int]
+    MATCH_INDEX_FIELD_NUMBER: _ClassVar[int]
+    from_node: str
+    to_node: str
+    term: int
+    success: bool
+    match_index: int
+    def __init__(self, from_node: _Optional[str] = ..., to_node: _Optional[str] = ..., term: _Optional[int] = ..., success: _Optional[bool] = ..., match_index: _Optional[int] = ...) -> None: ...

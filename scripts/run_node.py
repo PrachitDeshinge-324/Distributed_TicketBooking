@@ -33,12 +33,14 @@ def serve(
     llm_host: str = "localhost",
     llm_port: int = 50060,
     local_llm: bool = False,
+    snapshot_threshold: int = 200,
 ):
     node_data_dir = os.path.join(data_dir, node_id)
     config = ClusterConfig.from_args(
         node_id=node_id,
         peers_str=peers_str,
         data_dir=node_data_dir,
+        snapshot_threshold=snapshot_threshold,
     )
 
     booking_service = BookingService()
@@ -55,7 +57,7 @@ def serve(
             logger.warning(f"Could not connect to LLM server: {e}")
 
     # 1. Start Client-facing gRPC server
-    client_server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    client_server = grpc.server(futures.ThreadPoolExecutor(max_workers=64))
     ticket_service_pb2_grpc.add_TicketClientServiceServicer_to_server(
         TicketClientServicer(
             booking_service=booking_service,
@@ -78,7 +80,7 @@ def serve(
     client_server.start()
 
     # 2. Start Raft inter-node gRPC server
-    raft_server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    raft_server = grpc.server(futures.ThreadPoolExecutor(max_workers=32))
     ticket_service_pb2_grpc.add_RaftServiceServicer_to_server(
         RaftServiceServicer(raft_node),
         raft_server,
@@ -121,6 +123,8 @@ if __name__ == "__main__":
     parser.add_argument("--llm-host", type=str, default="localhost", help="LLM server host")
     parser.add_argument("--llm-port", type=int, default=50060, help="LLM server port")
     parser.add_argument("--local-llm", action="store_true", help="Run local LLM fallback inside node")
+    parser.add_argument("--snapshot-threshold", type=int, default=200,
+                        help="Compact the log into a snapshot after this many entries (0 = off)")
 
     args = parser.parse_args()
     serve(
@@ -132,4 +136,5 @@ if __name__ == "__main__":
         llm_host=args.llm_host,
         llm_port=args.llm_port,
         local_llm=args.local_llm,
+        snapshot_threshold=args.snapshot_threshold,
     )

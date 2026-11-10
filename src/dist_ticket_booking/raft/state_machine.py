@@ -1,11 +1,18 @@
 """State machine that applies committed Raft log entries to the BookingService."""
+import hashlib
+import json
 import logging
 import uuid
+from collections import OrderedDict
 from typing import Dict, Any, Optional
 
 from dist_ticket_booking.raft.log import LogEntry
 
 logger = logging.getLogger(__name__)
+
+
+def _field(slot, name, default=0):
+    return slot.get(name, default) if isinstance(slot, dict) else getattr(slot, name, default)
 
 
 class StateMachine:
@@ -21,6 +28,11 @@ class StateMachine:
         self.sessions: Dict[str, str] = {}  # token -> username (replicated)
         self.last_applied: int = -1
         self._results: Dict[int, dict] = {}  # log_index -> result cache
+        # Client request id -> result. A retried write (same request_id) that was
+        # already applied returns the original result instead of applying twice
+        # (Raft paper, section 8: linearizable semantics for client commands).
+        self._dedupe: "OrderedDict[str, dict]" = OrderedDict()
+        self.dedupe_capacity = 10000
 
     def apply(self, entry: LogEntry) -> dict:
         """Apply a committed log entry. Returns the operation result.
@@ -33,6 +45,14 @@ class StateMachine:
 
         cmd = entry.command
         result: Dict[str, Any] = {}
+
+        request_id = cmd.get("request_id") if isinstance(cmd, dict) else None
+        if request_id and request_id in self._dedupe:
+            result = dict(self._dedupe[request_id])
+            self.last_applied = entry.index
+            self._results[entry.index] = result
+            logger.info(f"Entry {entry.index}: duplicate request {request_id}, returning cached result")
+            return result
 
         try:
             if entry.command_type == "create_booking":
@@ -70,10 +90,26 @@ class StateMachine:
             logger.error(f"Error applying entry {entry.index}: {e}")
             result = {"status": "error", "message": str(e)}
 
+        if request_id:
+            self._dedupe[request_id] = result
+            while len(self._dedupe) > self.dedupe_capacity:
+                self._dedupe.popitem(last=False)
         self.last_applied = entry.index
         self._results[entry.index] = result
         logger.debug(f"Applied entry {entry.index} (type={entry.command_type}, term={entry.term})")
         return result
+
+    def digest(self) -> str:
+        """Short hash of the replicated business state (inventory + bookings).
+
+        Replicas that have applied the same log prefix must report the same
+        digest; the cluster monitor shows it so divergence is visible at once.
+        """
+        bs = self.booking_service
+        inventory = {sid: _field(slot, "available_count") for sid, slot in bs.ticket_store.items()}
+        bookings = {bid: b.get("status") for bid, b in bs.bookings.items()}
+        blob = json.dumps([inventory, bookings], sort_keys=True).encode()
+        return hashlib.sha1(blob).hexdigest()[:10]
 
     def get_session_user(self, token: str) -> Optional[str]:
         """Look up username for a session token."""
@@ -101,6 +137,7 @@ class StateMachine:
             "ticket_store": ticket_store_data,
             "bookings": dict(self.booking_service.bookings),
             "sessions": dict(self.sessions),
+            "dedupe": dict(self._dedupe),
             "last_applied": self.last_applied,
         }
 
@@ -115,5 +152,7 @@ class StateMachine:
             self.booking_service.bookings = state["bookings"]
         if "sessions" in state:
             self.sessions = state["sessions"]
+        if "dedupe" in state:
+            self._dedupe = OrderedDict(state["dedupe"])
         self.last_applied = state.get("last_applied", self.last_applied)
         logger.info(f"State machine restored from snapshot up to index {self.last_applied}")

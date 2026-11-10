@@ -1,4 +1,5 @@
 """Unit tests for Raft consensus engine components."""
+import json
 import os
 import shutil
 import tempfile
@@ -285,3 +286,109 @@ def test_node_recovery_from_snapshot(temp_dir):
     avail = node2.state_machine.booking_service.get_availability(target_slot)["available_count"]
     assert avail == 48  # 50 - 2 = 48
     node2.stop()
+
+
+def _bare_node(temp_dir, node_id="n1"):
+    from dist_ticket_booking.raft import PeerInfo
+    peers = {p: PeerInfo(p, "localhost", 1, "localhost", 2) for p in ("n2", "n3") if p != node_id}
+    cfg = ClusterConfig(node_id=node_id, peers=peers, data_dir=temp_dir)
+    return RaftNode(cfg, BookingService())
+
+
+def test_candidate_stepping_down_keeps_its_vote(temp_dir):
+    """Stepping down within the same term must not clear votedFor (one vote per term)."""
+    node = _bare_node(temp_dir)
+    node.current_term, node.voted_for = 3, "n1"
+    node._step_down(3)
+    assert node.voted_for == "n1"
+    vote = node.handle_request_vote(ticket_service_pb2.RequestVoteRequest(
+        from_node="n3", to_node="n1", term=3, last_log_index=10, last_log_term=3))
+    assert not vote.vote_granted
+    node._step_down(4)
+    assert node.voted_for is None and node.current_term == 4
+
+
+def test_follower_match_index_ignores_stale_suffix(temp_dir):
+    """match_index / commit must cover only entries the leader vouched for."""
+    node = _bare_node(temp_dir)
+    for i in range(3):  # stale uncommitted entries from an old term
+        node.log.append(LogEntry(term=1, index=i, command_type="noop", command={}))
+    req = ticket_service_pb2.AppendEntriesRequest(
+        from_node="n2", to_node="n1", term=2, prev_log_index=0, prev_log_term=1,
+        commit_index=2, entries=[])
+    res = node.handle_append_entries(req)
+    assert res.entry_appended and res.match_index == 0
+    assert node.commit_index == 0  # must not commit stale entries 1..2
+
+
+def test_restart_replays_only_committed_entries(temp_dir):
+    node = _bare_node(temp_dir)
+    node.log.append(LogEntry(term=1, index=0, command_type="login", command={"username": "a", "token": "t0"}))
+    node.log.append(LogEntry(term=1, index=1, command_type="login", command={"username": "b", "token": "t1"}))
+    node.commit_index = 0
+    node._apply_committed_entries()  # persists commit_index = 0
+    restarted = _bare_node(temp_dir)
+    restarted._replay_committed_entries()
+    assert restarted.state_machine.get_session_user("t0") == "a"
+    assert restarted.state_machine.get_session_user("t1") is None  # uncommitted
+
+
+def test_install_snapshot_on_follower(temp_dir):
+    leader_dir, follower_dir = os.path.join(temp_dir, "l"), os.path.join(temp_dir, "f")
+    os.makedirs(leader_dir), os.makedirs(follower_dir)
+    leader = _bare_node(leader_dir, "n2")
+    for i in range(3):
+        leader.log.append(LogEntry(term=1, index=i, command_type="login",
+                                   command={"username": f"u{i}", "token": f"t{i}"}))
+    leader.commit_index = 2
+    leader._apply_committed_entries()
+    assert leader.take_snapshot() and len(leader.log) == 0
+
+    follower = _bare_node(follower_dir, "n1")
+    snap = leader.log.snapshot
+    res = follower.handle_install_snapshot(ticket_service_pb2.InstallSnapshotRequest(
+        from_node="n2", to_node="n1", term=1, last_included_index=snap["last_included_index"],
+        last_included_term=snap["last_included_term"], data=json.dumps(snap["state"])))
+    assert res.success and res.match_index == 2
+    assert follower.state_machine.get_session_user("t2") == "u2"
+    # Subsequent AppendEntries right after the snapshot boundary is accepted
+    ae = follower.handle_append_entries(ticket_service_pb2.AppendEntriesRequest(
+        from_node="n2", to_node="n1", term=1, prev_log_index=2, prev_log_term=1, commit_index=3,
+        entries=[LogEntry(term=1, index=3, command_type="login",
+                          command={"username": "u3", "token": "t3"}).to_proto()]))
+    assert ae.entry_appended and ae.match_index == 3
+    assert follower.state_machine.get_session_user("t3") == "u3"
+
+
+def test_state_machine_dedupes_retried_requests():
+    """A write retried with the same request_id is applied once (exactly-once)."""
+    sm = StateMachine(BookingService())
+    slot = "SLOT-CVS-D1-110001"
+    before = sm.booking_service.get_availability(slot)["available_count"]
+    cmd = {"user_id": "alice", "ticket_id": slot, "quantity": 1, "request_id": "req-1"}
+    r1 = sm.apply(LogEntry(term=1, index=0, command_type="create_booking", command=cmd))
+    r2 = sm.apply(LogEntry(term=2, index=1, command_type="create_booking", command=cmd))  # retry
+    assert r1["status"] == "accepted" and r2 == r1
+    assert sm.booking_service.get_availability(slot)["available_count"] == before - 1
+    # dedupe table survives snapshot/restore
+    sm2 = StateMachine(BookingService())
+    sm2.restore_from_snapshot(sm.get_snapshot_data())
+    r3 = sm2.apply(LogEntry(term=2, index=2, command_type="create_booking", command=cmd))
+    assert r3["booking_id"] == r1["booking_id"]
+    assert sm2.booking_service.get_availability(slot)["available_count"] == before - 1
+
+
+def test_snapshot_is_point_in_time(temp_dir):
+    """Later state changes must not leak into an already-taken snapshot."""
+    node = _bare_node(temp_dir)
+    slot = "SLOT-CVS-D1-110001"
+    node.log.append(LogEntry(term=1, index=0, command_type="create_booking",
+                             command={"user_id": "alice", "ticket_id": slot, "quantity": 1}))
+    node.commit_index = 0
+    node._apply_committed_entries()
+    assert node.take_snapshot()
+    snap_bookings = node.log.snapshot["state"]["bookings"]
+    booking_id = next(iter(snap_bookings))
+    node.state_machine.booking_service.cancel_booking("alice", booking_id)  # live change after snapshot
+    assert snap_bookings[booking_id]["status"] == "confirmed"
+    assert node.log.snapshot["state"]["ticket_store"][slot]["available_count"] == 49
