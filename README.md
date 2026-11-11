@@ -230,7 +230,7 @@ Demonstrates multi-node replication and client transparent auto-redirect:
 python scripts/demo_raft.py
 ```
 
-### 3. Full 5-Node System Demo (recommended for the video)
+### 3. Full 5-Node System Demo (recommended)
 
 Starts the LLM node and 3 Raft nodes, runs the client node (20 concurrent users: bookings, cancels, availability, FAQ), **kills the leader at t=10 s under load**, restarts it at t=18 s, and finishes with the client's consistency audit and the cluster monitor (all replicas must show the same state digest):
 
