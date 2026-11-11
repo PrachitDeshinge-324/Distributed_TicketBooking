@@ -6,8 +6,6 @@ Architecture A (Distributed Ticket Booking), instantiated as a **distributed vac
 
 A gRPC-based, multi-node distributed booking system in Python implementing the **Raft Consensus Protocol** (Ongaro & Ousterhout). The system replicates state across a cluster of application server nodes, provides strong consistency for bookings and sessions, automatically elects a new leader upon node failure, and integrates a domain-specific LLM service (`Qwen3.5-0.8B` on CUDA/Apple MPS, with keyword fallback) running on an independent node.
 
-![Live run](docs/live-run.png)
-
 ---
 
 ## Contents
