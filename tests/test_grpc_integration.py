@@ -5,7 +5,7 @@ import uuid
 import pytest
 import grpc
 
-from dist_ticket_booking.business.booking_service import BookingService, VaccinationService
+from dist_ticket_booking.business.booking_service import VaccinationService
 from dist_ticket_booking.core.models import VaccineSlot, Ticket
 from dist_ticket_booking.grpc import ticket_service_pb2
 from dist_ticket_booking.grpc import ticket_service_pb2_grpc

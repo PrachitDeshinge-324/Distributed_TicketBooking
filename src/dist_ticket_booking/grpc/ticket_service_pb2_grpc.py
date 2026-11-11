@@ -5,7 +5,7 @@ import warnings
 
 from . import ticket_service_pb2 as ticket__service__pb2
 
-GRPC_GENERATED_VERSION = '1.83.1'
+GRPC_GENERATED_VERSION = '1.84.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -402,6 +402,172 @@ class LLMService:
             '/ticketservice.v1.LLMService/GetLLMAnswer',
             ticket__service__pb2.LLMQueryRequest.SerializeToString,
             ticket__service__pb2.GetLLMAnswerResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class RaftServiceStub:
+    """============ RAFT CONSENSUS SERVICE ============
+
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.RequestVote = channel.unary_unary(
+                '/ticketservice.v1.RaftService/RequestVote',
+                request_serializer=ticket__service__pb2.RequestVoteRequest.SerializeToString,
+                response_deserializer=ticket__service__pb2.RequestVoteResponse.FromString,
+                _registered_method=True)
+        self.AppendEntries = channel.unary_unary(
+                '/ticketservice.v1.RaftService/AppendEntries',
+                request_serializer=ticket__service__pb2.AppendEntriesRequest.SerializeToString,
+                response_deserializer=ticket__service__pb2.AppendEntriesResponse.FromString,
+                _registered_method=True)
+        self.InstallSnapshot = channel.unary_unary(
+                '/ticketservice.v1.RaftService/InstallSnapshot',
+                request_serializer=ticket__service__pb2.InstallSnapshotRequest.SerializeToString,
+                response_deserializer=ticket__service__pb2.InstallSnapshotResponse.FromString,
+                _registered_method=True)
+
+
+class RaftServiceServicer:
+    """============ RAFT CONSENSUS SERVICE ============
+
+    """
+
+    def RequestVote(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AppendEntries(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def InstallSnapshot(self, request, context):
+        """Log compaction (Raft paper section 7): leader ships its snapshot to a
+        follower whose next entry has already been compacted away.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_RaftServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'RequestVote': grpc.unary_unary_rpc_method_handler(
+                    servicer.RequestVote,
+                    request_deserializer=ticket__service__pb2.RequestVoteRequest.FromString,
+                    response_serializer=ticket__service__pb2.RequestVoteResponse.SerializeToString,
+            ),
+            'AppendEntries': grpc.unary_unary_rpc_method_handler(
+                    servicer.AppendEntries,
+                    request_deserializer=ticket__service__pb2.AppendEntriesRequest.FromString,
+                    response_serializer=ticket__service__pb2.AppendEntriesResponse.SerializeToString,
+            ),
+            'InstallSnapshot': grpc.unary_unary_rpc_method_handler(
+                    servicer.InstallSnapshot,
+                    request_deserializer=ticket__service__pb2.InstallSnapshotRequest.FromString,
+                    response_serializer=ticket__service__pb2.InstallSnapshotResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'ticketservice.v1.RaftService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('ticketservice.v1.RaftService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class RaftService:
+    """============ RAFT CONSENSUS SERVICE ============
+
+    """
+
+    @staticmethod
+    def RequestVote(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ticketservice.v1.RaftService/RequestVote',
+            ticket__service__pb2.RequestVoteRequest.SerializeToString,
+            ticket__service__pb2.RequestVoteResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AppendEntries(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ticketservice.v1.RaftService/AppendEntries',
+            ticket__service__pb2.AppendEntriesRequest.SerializeToString,
+            ticket__service__pb2.AppendEntriesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def InstallSnapshot(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ticketservice.v1.RaftService/InstallSnapshot',
+            ticket__service__pb2.InstallSnapshotRequest.SerializeToString,
+            ticket__service__pb2.InstallSnapshotResponse.FromString,
             options,
             channel_credentials,
             insecure,

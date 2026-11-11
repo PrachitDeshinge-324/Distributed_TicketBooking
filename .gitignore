@@ -70,7 +70,16 @@ venv.bak/
 .idea/
 *.pyc
 
-# Ignore all markdown files except README.md
+# Ignore all markdown files except README.md and REFLECTION_DOCUMENT.md
 docs/*.md
 *.md
 !README.md
+!REFLECTION_DOCUMENT.md
+!DEMO_VIDEO_SCRIPT.md
+
+# Raft persistent runtime data
+raft_data/
+raft_data_*/
+
+# Submission archives (build output of scripts/package_submission.sh)
+*.zip
