@@ -18,6 +18,16 @@ service LLMService {
   rpc GetLLMAnswer(LLMQueryRequest) returns (GetLLMAnswerResponse);
 }
 
+// ============ RAFT CONSENSUS SERVICE ============
+
+service RaftService {
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  // Log compaction (Raft paper section 7): leader ships its snapshot to a
+  // follower whose next entry has already been compacted away.
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
 // --- Messages for Client Functions ---
 
 message LoginRequest {
@@ -28,6 +38,8 @@ message LoginRequest {
 message LoginResponse {
   string status = 1;
   optional string token = 2;
+  string leader_hint = 3; // "host:port" or client address for leader redirect
+  string message = 4;     // human-readable detail (e.g. "no quorum")
 }
 
 message LogoutRequest {
@@ -37,12 +49,14 @@ message LogoutRequest {
 message StatusResponse {
   string status = 1;
   string message = 2;
+  string leader_hint = 3;
 }
 
 message PostRequest {
   string token = 1;
   string type = 2;
   string data = 3; // JSON string containing payload (e.g. ticket_id, quantity)
+  string request_id = 4; // client-chosen id, identical across retries -> exactly-once writes
 }
 
 message GetRequest {
@@ -59,6 +73,7 @@ message DataItem {
 message GetResponse {
   string status = 1;
   repeated DataItem items = 2;
+  string leader_hint = 3;
 }
 
 // --- Messages for Application Server Functions ---
@@ -86,4 +101,63 @@ message GetLLMAnswerResponse {
 message LLMQueryResponse {
   string request_id = 1;
   string answer = 2;
+}
+
+// --- Messages for Raft Consensus ---
+
+message RequestVoteRequest {
+  string from_node = 1;      // candidateId
+  string to_node = 2;        // candidate target
+  int64 term = 3;            // candidate's term
+  int64 last_log_index = 4;  // index of candidate's last log entry
+  int64 last_log_term = 5;   // term of candidate's last log entry
+}
+
+message RequestVoteResponse {
+  string from_node = 1;      // responding node
+  string to_node = 2;        // candidate
+  int64 term = 3;            // currentTerm, for candidate to update itself
+  bool vote_granted = 4;     // true means candidate received vote
+}
+
+message RaftLogEntry {
+  int64 term = 1;
+  int64 index = 2;
+  string command_type = 3;   // "create_booking", "cancel_booking", "login", "logout"
+  string command_json = 4;   // JSON-serialized command dictionary
+}
+
+message AppendEntriesRequest {
+  string from_node = 1;      // leaderId
+  string to_node = 2;        // follower
+  int64 term = 3;            // leader's term
+  int64 prev_log_index = 4;  // index of log entry immediately preceding new ones
+  int64 prev_log_term = 5;   // term of prev_log_index entry
+  int64 commit_index = 6;    // leader's commitIndex
+  repeated RaftLogEntry entries = 7; // log entries to store (empty for heartbeat)
+}
+
+message AppendEntriesResponse {
+  string from_node = 1;      // follower node id
+  string to_node = 2;        // leader node id
+  int64 term = 3;            // currentTerm, for leader to update itself
+  bool entry_appended = 4;   // true if follower contained entry matching prev_log_index and prev_log_term
+  int64 match_index = 5;     // highest index replicated on follower
+}
+
+message InstallSnapshotRequest {
+  string from_node = 1;            // leaderId
+  string to_node = 2;              // follower
+  int64 term = 3;                  // leader's term
+  int64 last_included_index = 4;   // snapshot replaces all entries up to and including this index
+  int64 last_included_term = 5;    // term of last_included_index
+  string data = 6;                 // JSON-serialized state machine snapshot
+}
+
+message InstallSnapshotResponse {
+  string from_node = 1;
+  string to_node = 2;
+  int64 term = 3;                  // currentTerm, for leader to update itself
+  bool success = 4;
+  int64 match_index = 5;           // follower's last_included_index after install
 }

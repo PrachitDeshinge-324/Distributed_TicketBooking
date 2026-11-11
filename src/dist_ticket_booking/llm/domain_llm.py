@@ -5,9 +5,12 @@ No internet connection is required after the first model download.
 Model weights are stored in the HuggingFace cache directory
 (~/.cache/huggingface/hub/ by default).
 
-Inference performance scales with the hardware running Node 1:
-a modern CPU handles Qwen2.5-0.5B in a few seconds per query;
-a GPU (CUDA or MPS) reduces this to under a second.
+Default model: Qwen/Qwen3.5-0.8B (hybrid linear/full attention).
+The device is picked automatically: CUDA > Apple MPS > CPU.
+On Apple Silicon (MPS, fp16) an answer takes ~2-4 s. On plain CPU the
+Qwen3.5 linear-attention layers run a slow reference implementation
+(~1-2 s per token), so the app server applies a deadline and falls back
+to keyword answers if the model is too slow.
 
 Concurrency design:
   - A single background worker thread owns the pipeline exclusively,
@@ -20,8 +23,13 @@ Concurrency design:
 import logging
 import queue
 import threading
+import re
 import time
-from typing import Optional
+
+DEFAULT_MODEL = "Qwen/Qwen3.5-0.8B"
+_MAX_NEW_TOKENS = 80
+_TOKENS_PER_LIVE_LINE = 30   # extra budget per slot listed in the live context
+_MAX_NEW_TOKENS_CAP = 320
 
 logger = logging.getLogger(__name__)
 
@@ -40,17 +48,52 @@ SYSTEM_CONTEXT = (
     "4. Age eligibility: 18+ for COVISHIELD and COVAXIN; 15-17 years for CORBEVAX only. "
     "5. Required documents: Any government-issued photo ID "
     "(Aadhaar card, Voter ID, Passport, Driving License). "
-    "6. Slot cancellation is allowed up to 24 hours before the scheduled appointment. "
+    "6. Cancellation deadline: an appointment can be cancelled only up to 24 hours before "
+    "its scheduled time. To cancel, use the cancel option with your booking ID; any fee paid is refunded. "
     "7. Government center slots are free. Private center slots may cost Rs. 150 to Rs. 250. "
     "8. Each citizen can book a maximum of 1 slot per appointment session. "
-    "Do not provide medical or clinical advice. Only answer booking-related questions."
+    "9. Booking: log in, check availability, then book a slot by its slot ID. "
+    "Do not provide medical or clinical advice. Only answer booking-related questions. "
+    "When live system data is provided, use it for questions about availability: "
+    "mention every slot that is relevant, and state the price exactly as given "
+    "(say 'free' only when the data says 'free of charge'). "
+    "Never speculate about reasons, demand or future dates that are not in the data. "
+    "If a 'Relevant policy' is given, restate it accurately and keep every number and "
+    "time limit exactly as written. Use only the facts provided; never invent contact "
+    "details, penalties or extra steps. Reply in at most 2 short sentences."
 )
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_SENTENCE_END_RE = re.compile(r"[.!?)](?=\s|$)")
+
+
+def _trim_incomplete(text: str) -> str:
+    """Drop a trailing half-sentence left when generation hit the token limit."""
+    text = text.strip()
+    if not text or text[-1] in ".!?)":
+        return text
+    ends = [m.end() for m in _SENTENCE_END_RE.finditer(text)]
+    return text[: ends[-1]].strip() if ends else text
+
+
+def _pick_device():
+    import torch
+    if torch.cuda.is_available():
+        return "cuda", torch.float16
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps", torch.float16
+    return "cpu", torch.float32
+
+
+def _split_prompt(prompt: str):
+    query, _, context = prompt.partition("\n\nContext:")
+    return query.strip(), context.strip()
 
 # Keyword fallback — used when the model is not available
 _FAQ_FALLBACK = {
     "cancel": (
-        "You can cancel your appointment up to 24 hours before the scheduled time "
-        "using the cancellation option in your booking portal."
+        "Cancellation is allowed only up to 24 hours before your scheduled appointment. "
+        "To cancel, use the cancel option with your booking ID; any fee paid is refunded."
     ),
     "available": (
         "Slot availability depends on the vaccination center and date. "
@@ -71,7 +114,8 @@ _FAQ_FALLBACK = {
         "The minimum gap between COVAXIN Dose 1 and Dose 2 is 28 days (4 weeks)."
     ),
     "booster": (
-        "The booster (precaution) dose is allowed 9 months after completing Dose 2."
+        "The booster (precaution) dose is allowed only once at least 9 months have "
+        "passed since completing Dose 2."
     ),
     "age": (
         "COVISHIELD and COVAXIN are for ages 18+. "
@@ -80,8 +124,75 @@ _FAQ_FALLBACK = {
 }
 
 
-def _keyword_fallback(query: str) -> str:
+_LIVE_MARKER = "Current live slot availability:"
+_LIVE_QUERY_WORDS = ("available", "availability", "seat", "slot", "how many", "remaining", "left", "vacant", "open")
+
+
+def _relevant_policy(query: str) -> str:
+    """Policy snippets matching the query; grounds the small model's answer."""
     q = query.lower()
+    return " ".join(ans for kw, ans in _FAQ_FALLBACK.items() if kw in q and kw != "available")
+
+
+def _grounded(answer: str, query: str) -> str:
+    """Guardrail: a small model sometimes drops or inverts a key policy number
+    (e.g. the 24-hour cancellation deadline). If the matched policy contains a
+    number the answer leaves out, or says 'within 24 hours' for a deadline that is
+    'up to 24 hours before', return the verified policy text instead."""
+    policy = _relevant_policy(query)
+    if not policy:
+        return answer
+    missing = [n for n in re.findall(r"\d+", policy) if n not in re.findall(r"\d+", answer)]
+    inverted = "cancel" in query.lower() and re.search(r"within\s+24\s+hours", answer, re.I)
+    if missing or inverted:
+        return policy
+    return answer
+
+
+_LIVE_LINE_RE = re.compile(
+    r"^- (?P<name>.+?): (?:(?P<count>\d+) open slot\(s\) on (?P<date>\S+); price: (?P<price>.+)|SOLD OUT on (?P<sold_date>\S+))$"
+)
+_NEGATIVE_RE = re.compile(r"\b(no more|no (?:available|open|remaining)|none (?:left|remain)|sold out|fully booked|unavailable)\b", re.I)
+
+
+def _live_summary(rows) -> str:
+    parts = []
+    for r in rows:
+        if r["count"] is not None:
+            parts.append(f"{r['name']}: {r['count']} open slot(s) on {r['date']} ({r['price']})")
+        else:
+            parts.append(f"{r['name']}: sold out on {r['sold_date']}")
+    return "Live availability - " + "; ".join(parts) + "."
+
+
+def _grounded_availability(answer: str, context: str) -> str:
+    """Guardrail for live-availability answers.
+
+    For a focused question (at most 3 matching slots) the answer must state
+    every live seat count and must not claim 'no more / sold out' while seats
+    are open (or the reverse). Otherwise the reply is built directly from the
+    Raft-replicated data, so the assistant never contradicts the system state.
+    """
+    rows = [m.groupdict() for m in (_LIVE_LINE_RE.match(l.strip()) for l in context.splitlines()) if m]
+    if not rows or len(rows) > 3:
+        return answer
+    numbers = set(re.findall(r"\d+", answer))
+    missing = [r["count"] for r in rows if r["count"] is not None and r["count"] not in numbers]
+    any_open = any(r["count"] is not None for r in rows)
+    negative = bool(_NEGATIVE_RE.search(answer))
+    contradicts = (any_open and negative) or (not any_open and not negative)
+    if missing or contradicts:
+        return _live_summary(rows)
+    return answer
+
+
+def _keyword_fallback(prompt: str) -> str:
+    # The app server appends live inventory as "Context: ..." — answer
+    # availability questions from it so the bot reflects real Raft state.
+    query, _, context = prompt.partition("\n\nContext:")
+    q = query.lower()
+    if _LIVE_MARKER in context and any(w in q for w in _LIVE_QUERY_WORDS) and "cancel" not in q:
+        return context.strip()
     for keyword, answer in _FAQ_FALLBACK.items():
         if keyword in q:
             return answer
@@ -110,12 +221,15 @@ class DomainLLM:
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
+        model_name: str = DEFAULT_MODEL,
         batch_window_s: float = _BATCH_WINDOW_S,
+        max_new_tokens: int = _MAX_NEW_TOKENS,
     ):
         self.model_name = model_name
         self.batch_window_s = batch_window_s
-        self._pipeline = None
+        self.max_new_tokens = max_new_tokens
+        self._pipeline = None  # (tokenizer, model) once loaded
+        self.device = "cpu"
         self._request_queue: queue.Queue = queue.Queue()
 
         self._load_model()
@@ -127,51 +241,31 @@ class DomainLLM:
         try:
             import warnings
             import torch
-            from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+            from transformers import AutoTokenizer, AutoModelForCausalLM
             from transformers.utils import logging as hf_logging
 
-            # Suppress all noisy deprecation/generation warnings from transformers
             warnings.filterwarnings("ignore")
             hf_logging.set_verbosity_error()
 
-            logger.info(f"Loading '{self.model_name}' from local cache (offline mode)...")
+            self.device, dtype = _pick_device()
+            logger.info(f"Loading '{self.model_name}' on {self.device} (offline-first)...")
             try:
-                tokenizer = AutoTokenizer.from_pretrained(
-                    self.model_name,
-                    local_files_only=True,
-                    clean_up_tokenization_spaces=False,
-                )
+                tokenizer = AutoTokenizer.from_pretrained(self.model_name, local_files_only=True)
                 model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name,
-                    local_files_only=True,
-                    dtype=torch.float32,
+                    self.model_name, local_files_only=True, dtype=dtype
                 )
             except Exception:
-                logger.info(
-                    f"Local cache miss for '{self.model_name}'. "
-                    "Downloading model (first run only)..."
-                )
-                tokenizer = AutoTokenizer.from_pretrained(
-                    self.model_name,
-                    local_files_only=False,
-                    clean_up_tokenization_spaces=False,
-                )
-                model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name,
-                    local_files_only=False,
-                    dtype=torch.float32,
-                )
+                logger.info(f"Local cache miss for '{self.model_name}'. Downloading (first run only)...")
+                tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                model = AutoModelForCausalLM.from_pretrained(self.model_name, dtype=dtype)
 
             if tokenizer.pad_token_id is None:
                 tokenizer.pad_token_id = tokenizer.eos_token_id
+            tokenizer.padding_side = "left"  # required for batched decoder-only generation
 
-            self._pipeline = pipeline(
-                "text-generation",
-                model=model,
-                tokenizer=tokenizer,
-                device="cpu",
-            )
-            logger.info(f"Model '{self.model_name}' loaded successfully.")
+            model = model.to(self.device).eval()
+            self._pipeline = (tokenizer, model)
+            logger.info(f"Model '{self.model_name}' loaded successfully on {self.device}.")
 
         except Exception as exc:
             logger.warning(
@@ -223,36 +317,59 @@ class DomainLLM:
                     holder["status"] = "error"
                     event.set()
 
+    def _build_chat_text(self, tokenizer, prompt: str) -> str:
+        query, context = _split_prompt(prompt)
+        parts = []
+        if context and context != "TicketClientFAQ":
+            parts.append(f"Live system data:\n{context}")
+        policy = _relevant_policy(query)
+        if policy:
+            parts.append(f"Relevant policy: {policy}")
+        user = "\n\n".join(parts + [f"Question: {query}"]) if parts else query
+        messages = [
+            {"role": "system", "content": SYSTEM_CONTEXT},
+            {"role": "user", "content": user},
+        ]
+        try:
+            # Qwen3.x: disable the <think> reasoning block for fast, direct answers
+            return tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
+        except TypeError:
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
     def _run_pipeline_batch(self, prompts: list) -> list:
-        """Run the pipeline on a list of prompts in one batched call."""
+        """Run one batched (left-padded) greedy generation for all prompts."""
         if self._pipeline is None:
             return [_keyword_fallback(p) for p in prompts]
 
-        messages_batch = [
-            [
-                {"role": "system", "content": SYSTEM_CONTEXT},
-                {"role": "user", "content": p},
-            ]
-            for p in prompts
-        ]
-
-        # batch_size tells the pipeline how many samples to process in one pass
-        outputs = self._pipeline(
-            messages_batch,
-            max_new_tokens=200,
-            do_sample=True,
-            temperature=0.3,
-            batch_size=len(messages_batch),
-        )
-
+        import torch
+        tokenizer, model = self._pipeline
+        texts = [self._build_chat_text(tokenizer, p) for p in prompts]
+        # Listing live slots needs more room than a one-line FAQ answer.
+        live_lines = max(_split_prompt(p)[1].count("\n- ") for p in prompts)
+        budget = min(self.max_new_tokens + _TOKENS_PER_LIVE_LINE * live_lines, _MAX_NEW_TOKENS_CAP)
+        enc = tokenizer(texts, return_tensors="pt", padding=True).to(self.device)
+        with torch.no_grad():
+            out = model.generate(
+                **enc,
+                max_new_tokens=budget,
+                do_sample=False,
+                repetition_penalty=1.1,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        gen = out[:, enc["input_ids"].shape[1]:]
         results = []
-        for out in outputs:
-            # pipeline returns a list-of-dicts per sample when given a batch
-            generated = out[0]["generated_text"] if isinstance(out, list) else out["generated_text"]
-            if isinstance(generated, list):
-                results.append(generated[-1]["content"].strip())
+        for prompt, ids in zip(prompts, gen):
+            text = _trim_incomplete(_THINK_RE.sub("", tokenizer.decode(ids, skip_special_tokens=True)))
+            if not text:
+                results.append(_keyword_fallback(prompt))
             else:
-                results.append(str(generated).strip())
+                query, context = _split_prompt(prompt)
+                text = _grounded(text, query)
+                if _LIVE_MARKER in context:
+                    text = _grounded_availability(text, context)
+                results.append(text)
         return results
 
     # Public interface
