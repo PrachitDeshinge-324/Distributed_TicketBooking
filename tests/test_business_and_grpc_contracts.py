@@ -175,3 +175,18 @@ def test_grounding_guardrail_restores_policy_facts():
     good = "Cancel up to 24 hours before your appointment using your booking ID."
     assert _grounded(good, q) == good
     assert _grounded("Anything goes.", "hello there") == "Anything goes."
+
+
+def test_availability_guardrail_rejects_contradictions():
+    from dist_ticket_booking.llm.domain_llm import _grounded_availability
+    ctx = ("Current live slot availability:\n"
+           "- CORBEVAX Booster — Fortis Bangalore: 2 open slot(s) on 2026-10-07; price: paid, Rs. 250")
+    bad = "CORBEVAX has 2 available slots on 2026-10-07, but no more spots remain for this date."
+    fixed = _grounded_availability(bad, ctx)
+    assert "2 open slot(s)" in fixed and "no more" not in fixed
+    assert "3 slots" not in _grounded_availability("There are 3 slots left.", ctx)  # wrong count
+    good = "CORBEVAX has 2 slots left on 2026-10-07 at Rs. 250 each."
+    assert _grounded_availability(good, ctx) == good
+    sold = "Current live slot availability:\n- CORBEVAX Booster — Fortis Bangalore: SOLD OUT on 2026-10-07"
+    assert "sold out" in _grounded_availability("Yes, slots are open!", sold)
+    assert _grounded_availability("Sorry, it is sold out.", sold) == "Sorry, it is sold out."

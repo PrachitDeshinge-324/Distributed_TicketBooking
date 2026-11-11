@@ -149,6 +149,43 @@ def _grounded(answer: str, query: str) -> str:
     return answer
 
 
+_LIVE_LINE_RE = re.compile(
+    r"^- (?P<name>.+?): (?:(?P<count>\d+) open slot\(s\) on (?P<date>\S+); price: (?P<price>.+)|SOLD OUT on (?P<sold_date>\S+))$"
+)
+_NEGATIVE_RE = re.compile(r"\b(no more|no (?:available|open|remaining)|none (?:left|remain)|sold out|fully booked|unavailable)\b", re.I)
+
+
+def _live_summary(rows) -> str:
+    parts = []
+    for r in rows:
+        if r["count"] is not None:
+            parts.append(f"{r['name']}: {r['count']} open slot(s) on {r['date']} ({r['price']})")
+        else:
+            parts.append(f"{r['name']}: sold out on {r['sold_date']}")
+    return "Live availability - " + "; ".join(parts) + "."
+
+
+def _grounded_availability(answer: str, context: str) -> str:
+    """Guardrail for live-availability answers.
+
+    For a focused question (at most 3 matching slots) the answer must state
+    every live seat count and must not claim 'no more / sold out' while seats
+    are open (or the reverse). Otherwise the reply is built directly from the
+    Raft-replicated data, so the assistant never contradicts the system state.
+    """
+    rows = [m.groupdict() for m in (_LIVE_LINE_RE.match(l.strip()) for l in context.splitlines()) if m]
+    if not rows or len(rows) > 3:
+        return answer
+    numbers = set(re.findall(r"\d+", answer))
+    missing = [r["count"] for r in rows if r["count"] is not None and r["count"] not in numbers]
+    any_open = any(r["count"] is not None for r in rows)
+    negative = bool(_NEGATIVE_RE.search(answer))
+    contradicts = (any_open and negative) or (not any_open and not negative)
+    if missing or contradicts:
+        return _live_summary(rows)
+    return answer
+
+
 def _keyword_fallback(prompt: str) -> str:
     # The app server appends live inventory as "Context: ..." — answer
     # availability questions from it so the bot reflects real Raft state.
@@ -328,7 +365,11 @@ class DomainLLM:
             if not text:
                 results.append(_keyword_fallback(prompt))
             else:
-                results.append(_grounded(text, _split_prompt(prompt)[0]))
+                query, context = _split_prompt(prompt)
+                text = _grounded(text, query)
+                if _LIVE_MARKER in context:
+                    text = _grounded_availability(text, context)
+                results.append(text)
         return results
 
     # Public interface
