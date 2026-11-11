@@ -360,6 +360,7 @@ scripts/
   verify_milestone2.py                End-to-end Milestone 2 checks (LLM, quorum, restart, 5 nodes, snapshots)
   demo_full_system.py                 5-node demo: LLM + 3 Raft nodes + client node, leader kill under load
   run_clients.py                      Client node: concurrent users, stats, consistency audit
+  ask.py                              Ask the FAQ assistant one question (live demo helper)
   run_llm_server.py                   Standalone LLM node (Qwen3.5-0.8B)
   monitor_cluster.py                  Live cluster status dashboard
   client_demo.py                      Single client workflow demo
