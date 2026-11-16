@@ -1,4 +1,7 @@
 """Standalone LLM FAQ server."""
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "src"))
 import argparse
 import logging
 import os
@@ -10,21 +13,31 @@ from dist_ticket_booking.grpc import ticket_service_pb2_grpc
 from dist_ticket_booking.grpc.service import LLMServicer
 from dist_ticket_booking.llm.domain_llm import DEFAULT_MODEL, DomainLLM
 
-logging.basicConfig(level=getattr(logging, os.environ.get("RAFT_LOG_LEVEL", "INFO").upper(), logging.INFO), format="%(asctime)s [%(levelname)s] [LLM Server] %(message)s")
+logging.basicConfig(level=getattr(logging, os.environ.get("RAFT_LOG_LEVEL", "INFO").upper(), logging.INFO),
+                    format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
 
 
-def serve(port=50052, model_name=DEFAULT_MODEL):
+def serve(port=50060, model_name=DEFAULT_MODEL):
     llm_service = DomainLLM(model_name=model_name)
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=32))
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=32), options=[("grpc.so_reuseport", 0)])
 
     ticket_service_pb2_grpc.add_LLMServiceServicer_to_server(
         LLMServicer(llm_service), server
     )
 
-    server.add_insecure_port(f"[::]:{port}")
+    try:
+        bound = server.add_insecure_port(f"[::]:{port}")
+    except RuntimeError:
+        bound = 0
+    if not bound:
+        raise SystemExit(f"ERROR: port {port} is already in use. Is the LLM server already running?")
     server.start()
-    logger.info(f"LLM server running on port {port}")
+    print("=" * 78)
+    print(f"  AI / LLM SERVER   model={model_name} on {llm_service.device}"
+          f"{'' if llm_service._pipeline else '  (model not loaded: keyword fallback)'}")
+    print(f"  listening on :{port}  (GetLLMAnswer for FAQs, ExtractIntent for plain-English bookings)")
+    print("=" * 78, flush=True)
 
     try:
         server.wait_for_termination()
@@ -35,7 +48,7 @@ def serve(port=50052, model_name=DEFAULT_MODEL):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=50052)
+    parser.add_argument("--port", type=int, default=50060)
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
     args = parser.parse_args()
 

@@ -5,6 +5,9 @@ Purpose:
 - show how the dispatcher and logger work together
 - provide a quick way to check the project still runs as expected
 """
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "src"))
 
 from dist_ticket_booking.core.models import BookingRequest
 from dist_ticket_booking.scheduler.dispatcher import Dispatcher

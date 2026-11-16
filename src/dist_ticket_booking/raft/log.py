@@ -6,6 +6,8 @@ import threading
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Any
 
+from dist_ticket_booking.raft.storage import CorruptStateError, atomic_write_json, read_json
+
 logger = logging.getLogger(__name__)
 
 
@@ -53,9 +55,13 @@ class LogEntry:
 class RaftLog:
     """Manages the ordered Raft log with JSON persistence and log compaction.
 
-    Entries are indexed by their global logical index.
+    Entries are indexed by their global logical index and are always
+    contiguous, so lookups are O(1) offsets from the first retained entry.
     Log compaction discards entries up to `last_included_index`
     after they are committed and saved to stable snapshot storage.
+
+    Every mutation is written to disk atomically (see `storage.py`) before
+    the method returns, so an acknowledged entry survives a crash.
     """
 
     def __init__(self, data_dir: str, node_id: str):
@@ -75,13 +81,29 @@ class RaftLog:
             self._persist()
             return entry.index
 
+    def extend(self, entries: List[LogEntry]) -> None:
+        """Append several entries with a single disk write."""
+        if not entries:
+            return
+        with self._lock:
+            self._entries.extend(entries)
+            self._persist()
+
+    def _find(self, index: int) -> Optional[LogEntry]:
+        """Entry at a global index, or None. Caller holds self._lock."""
+        if not self._entries:
+            return None
+        pos = index - self._entries[0].index
+        if 0 <= pos < len(self._entries):
+            entry = self._entries[pos]
+            if entry.index == index:
+                return entry
+        return None
+
     def get(self, index: int) -> Optional[LogEntry]:
         """Get entry by global log index. Returns None if out of range or compacted."""
         with self._lock:
-            for e in self._entries:
-                if e.index == index:
-                    return e
-            return None
+            return self._find(index)
 
     def last_index(self) -> int:
         """Return the index of the last log entry, or snapshot's last_included_index if log is empty."""
@@ -108,10 +130,8 @@ class RaftLog:
         with self._lock:
             if index == self.last_included_index:
                 return self.last_included_term
-            for e in self._entries:
-                if e.index == index:
-                    return e.term
-            return None
+            entry = self._find(index)
+            return entry.term if entry else None
 
     def slice_from(self, start_index: int) -> List[LogEntry]:
         """Return entries from start_index onwards (inclusive)."""
@@ -129,17 +149,24 @@ class RaftLog:
                 )
                 self._persist()
 
-    def create_snapshot(self, last_included_index: int, last_included_term: int, state_data: dict):
-        """Save state machine snapshot and compact log entries up to last_included_index."""
+    def create_snapshot(self, last_included_index: int, last_included_term: int, state_data: dict,
+                        config: Optional[list] = None):
+        """Save state machine snapshot and compact log entries up to last_included_index.
+
+        `config` is the cluster membership as of last_included_index: once the
+        entries are compacted, the configuration entries among them are gone.
+        """
         with self._lock:
             snapshot_content = {
                 "last_included_index": last_included_index,
                 "last_included_term": last_included_term,
                 "state": state_data,
+                "config": config,
             }
             try:
-                with open(self._snapshot_path, "w") as f:
-                    json.dump(snapshot_content, f)
+                # Snapshot first, then the shortened log: if we crash in
+                # between, _load() drops the entries the snapshot covers.
+                atomic_write_json(self._snapshot_path, snapshot_content)
                 self.last_included_index = last_included_index
                 self.last_included_term = last_included_term
                 self.snapshot = snapshot_content
@@ -147,14 +174,15 @@ class RaftLog:
                 # Discard compacted entries
                 self._entries = [e for e in self._entries if e.index > last_included_index]
                 self._persist()
-                logger.info(
+                logger.debug(
                     f"Snapshot created at index {last_included_index} (term {last_included_term}). "
                     f"Compacted log now contains {len(self._entries)} entries."
                 )
             except OSError as e:
                 logger.error(f"Failed to create snapshot: {e}")
 
-    def install_snapshot(self, last_included_index: int, last_included_term: int, state_data: dict):
+    def install_snapshot(self, last_included_index: int, last_included_term: int, state_data: dict,
+                         config: Optional[list] = None):
         """Install a snapshot received from the leader (InstallSnapshot RPC).
 
         If the log already has an entry matching the snapshot's last index and
@@ -165,7 +193,7 @@ class RaftLog:
             keep_suffix = any(
                 e.index == last_included_index and e.term == last_included_term for e in self._entries
             )
-        self.create_snapshot(last_included_index, last_included_term, state_data)
+        self.create_snapshot(last_included_index, last_included_term, state_data, config)
         if not keep_suffix:
             with self._lock:
                 self._entries = []
@@ -175,15 +203,22 @@ class RaftLog:
         """Load snapshot file from disk if present."""
         if not os.path.exists(self._snapshot_path):
             return None
-        try:
-            with open(self._snapshot_path, "r") as f:
-                data = json.load(f)
-            self.last_included_index = data.get("last_included_index", -1)
-            self.last_included_term = data.get("last_included_term", 0)
-            self.snapshot = data
-            return data
-        except (OSError, json.JSONDecodeError) as e:
-            logger.error(f"Failed to load snapshot from {self._snapshot_path}: {e}")
+        data = read_json(self._snapshot_path)
+        self.last_included_index = data.get("last_included_index", -1)
+        self.last_included_term = data.get("last_included_term", 0)
+        self.snapshot = data
+        return data
+
+    def latest_config(self, up_to: Optional[int] = None):
+        """(index, members) of the newest configuration entry at or below `up_to`
+        (whole log if None), falling back to the snapshot's configuration.
+        Returns None if neither has one."""
+        with self._lock:
+            for e in reversed(self._entries):
+                if e.command_type == "config" and (up_to is None or e.index <= up_to):
+                    return e.index, e.command["members"]
+            if self.snapshot and self.snapshot.get("config"):
+                return self.last_included_index, self.snapshot["config"]
             return None
 
     def __len__(self) -> int:
@@ -191,27 +226,35 @@ class RaftLog:
             return len(self._entries)
 
     def _persist(self):
-        """Write log to JSON file."""
+        """Write the log to disk atomically. Caller holds self._lock."""
         try:
-            data = [e.to_dict() for e in self._entries]
-            with open(self._persist_path, "w") as f:
-                json.dump(data, f)
+            atomic_write_json(self._persist_path, [e.to_dict() for e in self._entries])
         except OSError as e:
             logger.error(f"Failed to persist log: {e}")
+            raise
 
     def _load(self):
-        """Load snapshot and log from JSON files on startup."""
+        """Load snapshot and log from disk on startup.
+
+        Raises CorruptStateError if a file exists but cannot be parsed: a
+        node must never restart with an empty log it once acknowledged.
+        """
         self.load_snapshot()
         if not os.path.exists(self._persist_path):
             return
-        try:
-            with open(self._persist_path, "r") as f:
-                data = json.load(f)
-            self._entries = [LogEntry.from_dict(d) for d in data]
-            logger.info(
-                f"Loaded {len(self._entries)} log entries (snapshot up to {self.last_included_index}) "
-                f"from {self._persist_path}"
-            )
-        except (OSError, json.JSONDecodeError) as e:
-            logger.error(f"Failed to load log from {self._persist_path}: {e}")
-            self._entries = []
+        entries = [LogEntry.from_dict(d) for d in read_json(self._persist_path)]
+        # A crash between writing a snapshot and rewriting the log leaves
+        # entries the snapshot already covers; they are safe to drop.
+        self._entries = [e for e in entries if e.index > self.last_included_index]
+        if self._entries and self._entries[0].index != self.last_included_index + 1:
+            # Entries are missing between the snapshot and the log (e.g. the
+            # snapshot file was deleted). Starting anyway would leave this node
+            # unable to apply anything while reporting progress.
+            raise CorruptStateError(
+                f"{self._persist_path} starts at entry {self._entries[0].index} but the snapshot "
+                f"only covers up to {self.last_included_index}; delete this node's data directory "
+                f"(or start it with --fresh) so it re-syncs from the leader")
+        logger.info(
+            f"Loaded {len(self._entries)} log entries (snapshot up to {self.last_included_index}) "
+            f"from {self._persist_path}"
+        )

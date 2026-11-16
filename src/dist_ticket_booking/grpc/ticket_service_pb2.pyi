@@ -119,18 +119,22 @@ class LLMQueryResponse(_message.Message):
     def __init__(self, request_id: _Optional[str] = ..., answer: _Optional[str] = ...) -> None: ...
 
 class RequestVoteRequest(_message.Message):
-    __slots__ = ("from_node", "to_node", "term", "last_log_index", "last_log_term")
+    __slots__ = ("from_node", "to_node", "term", "last_log_index", "last_log_term", "pre_vote", "leadership_transfer")
     FROM_NODE_FIELD_NUMBER: _ClassVar[int]
     TO_NODE_FIELD_NUMBER: _ClassVar[int]
     TERM_FIELD_NUMBER: _ClassVar[int]
     LAST_LOG_INDEX_FIELD_NUMBER: _ClassVar[int]
     LAST_LOG_TERM_FIELD_NUMBER: _ClassVar[int]
+    PRE_VOTE_FIELD_NUMBER: _ClassVar[int]
+    LEADERSHIP_TRANSFER_FIELD_NUMBER: _ClassVar[int]
     from_node: str
     to_node: str
     term: int
     last_log_index: int
     last_log_term: int
-    def __init__(self, from_node: _Optional[str] = ..., to_node: _Optional[str] = ..., term: _Optional[int] = ..., last_log_index: _Optional[int] = ..., last_log_term: _Optional[int] = ...) -> None: ...
+    pre_vote: bool
+    leadership_transfer: bool
+    def __init__(self, from_node: _Optional[str] = ..., to_node: _Optional[str] = ..., term: _Optional[int] = ..., last_log_index: _Optional[int] = ..., last_log_term: _Optional[int] = ..., pre_vote: _Optional[bool] = ..., leadership_transfer: _Optional[bool] = ...) -> None: ...
 
 class RequestVoteResponse(_message.Message):
     __slots__ = ("from_node", "to_node", "term", "vote_granted")
@@ -189,20 +193,22 @@ class AppendEntriesResponse(_message.Message):
     def __init__(self, from_node: _Optional[str] = ..., to_node: _Optional[str] = ..., term: _Optional[int] = ..., entry_appended: _Optional[bool] = ..., match_index: _Optional[int] = ...) -> None: ...
 
 class InstallSnapshotRequest(_message.Message):
-    __slots__ = ("from_node", "to_node", "term", "last_included_index", "last_included_term", "data")
+    __slots__ = ("from_node", "to_node", "term", "last_included_index", "last_included_term", "data", "config_json")
     FROM_NODE_FIELD_NUMBER: _ClassVar[int]
     TO_NODE_FIELD_NUMBER: _ClassVar[int]
     TERM_FIELD_NUMBER: _ClassVar[int]
     LAST_INCLUDED_INDEX_FIELD_NUMBER: _ClassVar[int]
     LAST_INCLUDED_TERM_FIELD_NUMBER: _ClassVar[int]
     DATA_FIELD_NUMBER: _ClassVar[int]
+    CONFIG_JSON_FIELD_NUMBER: _ClassVar[int]
     from_node: str
     to_node: str
     term: int
     last_included_index: int
     last_included_term: int
     data: str
-    def __init__(self, from_node: _Optional[str] = ..., to_node: _Optional[str] = ..., term: _Optional[int] = ..., last_included_index: _Optional[int] = ..., last_included_term: _Optional[int] = ..., data: _Optional[str] = ...) -> None: ...
+    config_json: str
+    def __init__(self, from_node: _Optional[str] = ..., to_node: _Optional[str] = ..., term: _Optional[int] = ..., last_included_index: _Optional[int] = ..., last_included_term: _Optional[int] = ..., data: _Optional[str] = ..., config_json: _Optional[str] = ...) -> None: ...
 
 class InstallSnapshotResponse(_message.Message):
     __slots__ = ("from_node", "to_node", "term", "success", "match_index")
@@ -217,3 +223,45 @@ class InstallSnapshotResponse(_message.Message):
     success: bool
     match_index: int
     def __init__(self, from_node: _Optional[str] = ..., to_node: _Optional[str] = ..., term: _Optional[int] = ..., success: _Optional[bool] = ..., match_index: _Optional[int] = ...) -> None: ...
+
+class TimeoutNowRequest(_message.Message):
+    __slots__ = ("from_node", "to_node", "term")
+    FROM_NODE_FIELD_NUMBER: _ClassVar[int]
+    TO_NODE_FIELD_NUMBER: _ClassVar[int]
+    TERM_FIELD_NUMBER: _ClassVar[int]
+    from_node: str
+    to_node: str
+    term: int
+    def __init__(self, from_node: _Optional[str] = ..., to_node: _Optional[str] = ..., term: _Optional[int] = ...) -> None: ...
+
+class TimeoutNowResponse(_message.Message):
+    __slots__ = ("from_node", "to_node", "term", "success")
+    FROM_NODE_FIELD_NUMBER: _ClassVar[int]
+    TO_NODE_FIELD_NUMBER: _ClassVar[int]
+    TERM_FIELD_NUMBER: _ClassVar[int]
+    SUCCESS_FIELD_NUMBER: _ClassVar[int]
+    from_node: str
+    to_node: str
+    term: int
+    success: bool
+    def __init__(self, from_node: _Optional[str] = ..., to_node: _Optional[str] = ..., term: _Optional[int] = ..., success: _Optional[bool] = ...) -> None: ...
+
+class MembershipChangeRequest(_message.Message):
+    __slots__ = ("action", "node_id", "host", "raft_port", "client_port")
+    ACTION_FIELD_NUMBER: _ClassVar[int]
+    NODE_ID_FIELD_NUMBER: _ClassVar[int]
+    HOST_FIELD_NUMBER: _ClassVar[int]
+    RAFT_PORT_FIELD_NUMBER: _ClassVar[int]
+    CLIENT_PORT_FIELD_NUMBER: _ClassVar[int]
+    action: str
+    node_id: str
+    host: str
+    raft_port: int
+    client_port: int
+    def __init__(self, action: _Optional[str] = ..., node_id: _Optional[str] = ..., host: _Optional[str] = ..., raft_port: _Optional[int] = ..., client_port: _Optional[int] = ...) -> None: ...
+
+class TransferLeadershipRequest(_message.Message):
+    __slots__ = ("target_node",)
+    TARGET_NODE_FIELD_NUMBER: _ClassVar[int]
+    target_node: str
+    def __init__(self, target_node: _Optional[str] = ...) -> None: ...

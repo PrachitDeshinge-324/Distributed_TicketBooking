@@ -29,7 +29,9 @@ class InProcessNode:
         self.service = BookingService()
         self.raft_node = None
 
-    def setup_raft(self, all_nodes):
+    def setup_raft(self, all_nodes, join=False):
+        """`all_nodes`: the current members. With join=True this node starts
+        outside the configuration and waits to be added."""
         peers = {}
         for n in all_nodes:
             if n.node_id != self.node_id:
@@ -47,6 +49,8 @@ class InProcessNode:
             heartbeat_interval_ms=50,
             election_timeout_min_ms=150,
             election_timeout_max_ms=300,
+            self_info=PeerInfo(self.node_id, "localhost", self.raft_port, "localhost", self.client_port),
+            voting=not join,
         )
         self.raft_node = RaftNode(config, self.service)
 

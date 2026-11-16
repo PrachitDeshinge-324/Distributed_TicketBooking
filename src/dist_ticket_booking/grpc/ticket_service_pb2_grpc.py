@@ -245,6 +245,16 @@ class TicketAppServiceStub:
                 request_serializer=ticket__service__pb2.LLMQueryRequest.SerializeToString,
                 response_deserializer=ticket__service__pb2.GetLLMAnswerResponse.FromString,
                 _registered_method=True)
+        self.ChangeMembership = channel.unary_unary(
+                '/ticketservice.v1.TicketAppService/ChangeMembership',
+                request_serializer=ticket__service__pb2.MembershipChangeRequest.SerializeToString,
+                response_deserializer=ticket__service__pb2.StatusResponse.FromString,
+                _registered_method=True)
+        self.TransferLeadership = channel.unary_unary(
+                '/ticketservice.v1.TicketAppService/TransferLeadership',
+                request_serializer=ticket__service__pb2.TransferLeadershipRequest.SerializeToString,
+                response_deserializer=ticket__service__pb2.StatusResponse.FromString,
+                _registered_method=True)
 
 
 class TicketAppServiceServicer:
@@ -262,6 +272,19 @@ class TicketAppServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ChangeMembership(self, request, context):
+        """Cluster administration (operator tools, see scripts/cluster_admin.py)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def TransferLeadership(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_TicketAppServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -274,6 +297,16 @@ def add_TicketAppServiceServicer_to_server(servicer, server):
                     servicer.GetLLMAnswer,
                     request_deserializer=ticket__service__pb2.LLMQueryRequest.FromString,
                     response_serializer=ticket__service__pb2.GetLLMAnswerResponse.SerializeToString,
+            ),
+            'ChangeMembership': grpc.unary_unary_rpc_method_handler(
+                    servicer.ChangeMembership,
+                    request_deserializer=ticket__service__pb2.MembershipChangeRequest.FromString,
+                    response_serializer=ticket__service__pb2.StatusResponse.SerializeToString,
+            ),
+            'TransferLeadership': grpc.unary_unary_rpc_method_handler(
+                    servicer.TransferLeadership,
+                    request_deserializer=ticket__service__pb2.TransferLeadershipRequest.FromString,
+                    response_serializer=ticket__service__pb2.StatusResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -340,6 +373,60 @@ class TicketAppService:
             metadata,
             _registered_method=True)
 
+    @staticmethod
+    def ChangeMembership(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ticketservice.v1.TicketAppService/ChangeMembership',
+            ticket__service__pb2.MembershipChangeRequest.SerializeToString,
+            ticket__service__pb2.StatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def TransferLeadership(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ticketservice.v1.TicketAppService/TransferLeadership',
+            ticket__service__pb2.TransferLeadershipRequest.SerializeToString,
+            ticket__service__pb2.StatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
 
 class LLMServiceStub:
     """Missing associated documentation comment in .proto file."""
@@ -355,6 +442,11 @@ class LLMServiceStub:
                 request_serializer=ticket__service__pb2.LLMQueryRequest.SerializeToString,
                 response_deserializer=ticket__service__pb2.GetLLMAnswerResponse.FromString,
                 _registered_method=True)
+        self.ExtractIntent = channel.unary_unary(
+                '/ticketservice.v1.LLMService/ExtractIntent',
+                request_serializer=ticket__service__pb2.LLMQueryRequest.SerializeToString,
+                response_deserializer=ticket__service__pb2.GetLLMAnswerResponse.FromString,
+                _registered_method=True)
 
 
 class LLMServiceServicer:
@@ -366,11 +458,25 @@ class LLMServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ExtractIntent(self, request, context):
+        """Natural-language booking assistant: turns a citizen's sentence into a
+        JSON intent (action, vaccine, city, dose, booking id). The answer field
+        carries the JSON; the app server validates it before acting.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_LLMServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'GetLLMAnswer': grpc.unary_unary_rpc_method_handler(
                     servicer.GetLLMAnswer,
+                    request_deserializer=ticket__service__pb2.LLMQueryRequest.FromString,
+                    response_serializer=ticket__service__pb2.GetLLMAnswerResponse.SerializeToString,
+            ),
+            'ExtractIntent': grpc.unary_unary_rpc_method_handler(
+                    servicer.ExtractIntent,
                     request_deserializer=ticket__service__pb2.LLMQueryRequest.FromString,
                     response_serializer=ticket__service__pb2.GetLLMAnswerResponse.SerializeToString,
             ),
@@ -412,6 +518,33 @@ class LLMService:
             metadata,
             _registered_method=True)
 
+    @staticmethod
+    def ExtractIntent(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ticketservice.v1.LLMService/ExtractIntent',
+            ticket__service__pb2.LLMQueryRequest.SerializeToString,
+            ticket__service__pb2.GetLLMAnswerResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
 
 class RaftServiceStub:
     """============ RAFT CONSENSUS SERVICE ============
@@ -438,6 +571,11 @@ class RaftServiceStub:
                 '/ticketservice.v1.RaftService/InstallSnapshot',
                 request_serializer=ticket__service__pb2.InstallSnapshotRequest.SerializeToString,
                 response_deserializer=ticket__service__pb2.InstallSnapshotResponse.FromString,
+                _registered_method=True)
+        self.TimeoutNow = channel.unary_unary(
+                '/ticketservice.v1.RaftService/TimeoutNow',
+                request_serializer=ticket__service__pb2.TimeoutNowRequest.SerializeToString,
+                response_deserializer=ticket__service__pb2.TimeoutNowResponse.FromString,
                 _registered_method=True)
 
 
@@ -466,6 +604,14 @@ class RaftServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def TimeoutNow(self, request, context):
+        """Leadership transfer (Raft thesis 3.10): tells a caught-up follower to
+        start an election immediately.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_RaftServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -483,6 +629,11 @@ def add_RaftServiceServicer_to_server(servicer, server):
                     servicer.InstallSnapshot,
                     request_deserializer=ticket__service__pb2.InstallSnapshotRequest.FromString,
                     response_serializer=ticket__service__pb2.InstallSnapshotResponse.SerializeToString,
+            ),
+            'TimeoutNow': grpc.unary_unary_rpc_method_handler(
+                    servicer.TimeoutNow,
+                    request_deserializer=ticket__service__pb2.TimeoutNowRequest.FromString,
+                    response_serializer=ticket__service__pb2.TimeoutNowResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -568,6 +719,33 @@ class RaftService:
             '/ticketservice.v1.RaftService/InstallSnapshot',
             ticket__service__pb2.InstallSnapshotRequest.SerializeToString,
             ticket__service__pb2.InstallSnapshotResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def TimeoutNow(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ticketservice.v1.RaftService/TimeoutNow',
+            ticket__service__pb2.TimeoutNowRequest.SerializeToString,
+            ticket__service__pb2.TimeoutNowResponse.FromString,
             options,
             channel_credentials,
             insecure,

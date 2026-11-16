@@ -309,7 +309,11 @@ class VaccinationService:
         return {
             "status": "success",
             "booking_id": booking_id,
-            "message": f"Appointment {booking_id} cancelled. Slot released.",
+            "message": (
+                f"Cancelled your {booking.get('vaccine_name', '')} Dose {booking.get('dose_number', '')} "
+                f"appointment at {booking.get('center_name', '')} on {booking.get('scheduled_date', '')} "
+                f"({booking_id}). The slot was released."
+            ),
         }
 
     cancel_appointment = cancel_booking

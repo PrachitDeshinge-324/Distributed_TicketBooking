@@ -20,6 +20,7 @@ Concurrency design:
     pass — this is significantly faster than N sequential calls when
     multiple clients send queries at the same time.
 """
+import json
 import logging
 import queue
 import threading
@@ -62,6 +63,23 @@ SYSTEM_CONTEXT = (
     "time limit exactly as written. Use only the facts provided; never invent contact "
     "details, penalties or extra steps. Reply in at most 2 short sentences."
 )
+
+INTENT_SYSTEM = (
+    "You convert a citizen's message to a vaccination booking system into JSON. "
+    "Reply with ONE JSON object and nothing else, with keys: "
+    '"action" ("book", "cancel" or "question"), "vaccine" (one of the allowed vaccines or null), '
+    '"city" (one of the allowed cities or null), "dose" (1, 2 or 3 for a booster, or null), '
+    '"booking_id" (an id like APPT-... if the message contains one, else null). '
+    "Use null for anything the message does not say. Never guess."
+)
+INTENT_EXAMPLES = [
+    ("I need my second covaxin shot in Bombay",
+     {"action": "book", "vaccine": "COVAXIN", "city": "Mumbai", "dose": 2, "booking_id": None}),
+    ("please cancel APPT-SLOT-CVS-D1-alice-12",
+     {"action": "cancel", "vaccine": None, "city": None, "dose": None, "booking_id": "APPT-SLOT-CVS-D1-alice-12"}),
+    ("what documents should I carry?",
+     {"action": "question", "vaccine": None, "city": None, "dose": None, "booking_id": None}),
+]
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _SENTENCE_END_RE = re.compile(r"[.!?)](?=\s|$)")
@@ -301,21 +319,53 @@ class DomainLLM:
                 except queue.Empty:
                     break
 
-            prompts = [item[0] for item in batch]
             logger.debug(f"Processing batch of {len(batch)} query(ies).")
+            # FAQ answers and intent extraction use different prompts and
+            # decoding settings, so each kind runs as its own batched pass.
+            for kind, runner in (("faq", self._run_pipeline_batch), ("intent", self._run_intent_batch)):
+                group = [item for item in batch if item[3] == kind]
+                if not group:
+                    continue
+                try:
+                    answers = runner([item[0] for item in group])
+                    for (_, event, holder, _), answer in zip(group, answers):
+                        holder["response"] = answer
+                        holder["status"] = "ready"
+                        event.set()
+                except Exception as exc:
+                    logger.error(f"Batch inference error: {exc}")
+                    for (_, event, holder, _) in group:
+                        holder["response"] = f"Inference error: {exc}"
+                        holder["status"] = "error"
+                        event.set()
 
-            try:
-                answers = self._run_pipeline_batch(prompts)
-                for (_, event, holder), answer in zip(batch, answers):
-                    holder["response"] = answer
-                    holder["status"] = "ready"
-                    event.set()
-            except Exception as exc:
-                logger.error(f"Batch inference error: {exc}")
-                for (_, event, holder) in batch:
-                    holder["response"] = f"Inference error: {exc}"
-                    holder["status"] = "error"
-                    event.set()
+    def _build_intent_text(self, tokenizer, prompt: str) -> str:
+        text, allowed = _split_prompt(prompt)
+        messages = [{"role": "system", "content": f"{INTENT_SYSTEM} Allowed values - {allowed}"}]
+        for example, answer in INTENT_EXAMPLES:
+            messages.append({"role": "user", "content": example})
+            messages.append({"role": "assistant", "content": json.dumps(answer)})
+        messages.append({"role": "user", "content": text})
+        try:
+            return tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
+        except TypeError:
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    def _run_intent_batch(self, prompts: list) -> list:
+        """Batched JSON intent extraction (greedy decoding)."""
+        if self._pipeline is None:
+            return [_rule_intent_json(p) for p in prompts]
+        import torch
+        tokenizer, model = self._pipeline
+        texts = [self._build_intent_text(tokenizer, p) for p in prompts]
+        enc = tokenizer(texts, return_tensors="pt", padding=True).to(self.device)
+        with torch.no_grad():
+            out = model.generate(**enc, max_new_tokens=80, do_sample=False,
+                                 pad_token_id=tokenizer.pad_token_id)
+        gen = out[:, enc["input_ids"].shape[1]:]
+        return [_THINK_RE.sub("", tokenizer.decode(ids, skip_special_tokens=True)).strip() for ids in gen]
 
     def _build_chat_text(self, tokenizer, prompt: str) -> str:
         query, context = _split_prompt(prompt)
@@ -376,9 +426,12 @@ class DomainLLM:
 
     def generate_recommendation(self, prompt: str) -> dict:
         """Submit a prompt and block until the worker returns the answer."""
+        return self._submit(prompt, "faq")
+
+    def _submit(self, prompt: str, kind: str) -> dict:
         result_holder: dict = {}
         done = threading.Event()
-        self._request_queue.put((prompt, done, result_holder))
+        self._request_queue.put((prompt, done, result_holder, kind))
         done.wait()
         return {
             "model": self.model_name,
@@ -395,3 +448,17 @@ class DomainLLM:
             "answer": res.get("response", ""),
             "status": res.get("status", "error"),
         }
+
+    def extract_intent(self, request_id: str, text: str, allowed: str = "") -> dict:
+        """JSON intent for a natural-language booking/cancellation request."""
+        res = self._submit(f"{text}\n\nContext: {allowed}" if allowed else text, "intent")
+        return {"request_id": request_id, "answer": res.get("response", ""), "status": res.get("status", "error")}
+
+
+def _rule_intent_json(prompt: str) -> str:
+    """Intent extraction without a model (keyword rules), as JSON text."""
+    from dist_ticket_booking.llm.intent import rule_based_intent
+    text, allowed = _split_prompt(prompt)
+    m = re.search(r"cities:\s*([^;]*)", allowed)
+    cities = [c.strip() for c in m.group(1).split(",") if c.strip()] if m else []
+    return json.dumps(rule_based_intent(text, cities))

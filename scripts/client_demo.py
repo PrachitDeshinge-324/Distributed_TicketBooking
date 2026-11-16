@@ -1,63 +1,128 @@
-"""Sample client workflow to test the booking service endpoints."""
+"""Client node walkthrough: every client function of the assignment, step by step.
+
+Runs login -> get(availability) -> get(faq) -> post(booking) -> get(my_bookings)
+-> post(assistant, plain English) -> post(cancel) -> logout against the cluster,
+printing which node answered each call. Any node can be given: followers
+redirect to the Raft leader automatically.
+
+    python scripts/client_demo.py                       # local 3-node cluster
+    python scripts/client_demo.py --nodes 10.0.0.2:50051,10.0.0.3:50053,10.0.0.4:50055
+    python scripts/client_demo.py --user ravi --slot SLOT-CVX-D1-400001
+"""
+import argparse
+import json
 import logging
+import os
 import sys
+import time
+import uuid
 
-from dist_ticket_booking.grpc.service import TicketClient
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+import grpc  # noqa: E402
+
+from dist_ticket_booking.grpc.service import TicketClient  # noqa: E402
+
+DEFAULT_NODES = "localhost:50051,localhost:50053,localhost:50055"
 
 
-def run(host="localhost", port=50051):
-    logger.info(f"Connecting to server at {host}:{port}")
-    client = TicketClient(host=host, port=port)
+def step(n, title):
+    print(f"\n[{n}] {title}")
 
+
+def show(res, client, t0):
+    print(f"    -> {res.status.upper()}  (served by {client.target}, {(time.monotonic() - t0) * 1000:.0f} ms)")
+
+
+def availability_table(items):
+    print(f"    {'SLOT':<22}{'VACCINE':<12}{'DOSE':<6}{'CENTRE':<28}{'DATE':<12}{'OPEN':>5}{'PRICE':>8}")
+    for i in items:
+        d = json.loads(i.data)
+        price = "free" if not d["price"] else f"Rs.{d['price']:.0f}"
+        print(f"    {i.id:<22}{d['vaccine_name']:<12}{d['dose_number']:<6}{d['center_name']:<28}"
+              f"{d['date']:<12}{d['available_count']:>5}{price:>8}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--nodes", default=DEFAULT_NODES, help="comma-separated client endpoints (any nodes)")
+    parser.add_argument("--user", default="alice")
+    parser.add_argument("--password", default="password")
+    parser.add_argument("--slot", default="SLOT-CVS-D1-110001", help="slot to book in step 4")
+    args = parser.parse_args()
+    logging.disable(logging.WARNING)
+
+    targets = [t.strip() for t in args.nodes.split(",") if t.strip()]
+    client = TicketClient.for_cluster(targets)
+    print(f"CLIENT NODE -> cluster {', '.join(targets)}")
     try:
-        login_res = client.login("alice", "password")
-        token = login_res.token
-        if not token:
-            logger.error("Login failed, aborting")
-            return
-        logger.info(f"Logged in successfully. Session token: {token[:8]}...")
+        step(1, f"login('{args.user}', password)")
+        t0 = time.monotonic()
+        res = client.login(args.user, args.password)
+        show(res, client, t0)
+        if res.status != "success":
+            sys.exit(f"    login failed: {res.message}")
+        token = res.token
+        print(f"    session token {token[:8]}... (replicated to every node through Raft)")
 
-        # check initial slot availability
-        avail_res = client.get(token, "availability", {"ticket_id": "SLOT-CVS-D1-110001"})
-        for item in avail_res.items:
-            logger.info(f"Availability for {item.id}: {item.data}")
+        step(2, "get(token, 'availability')")
+        t0 = time.monotonic()
+        res = client.get(token, "availability")
+        show(res, client, t0)
+        availability_table(res.items)
 
-        # query support chatbot
-        for query in ["How to cancel a booking?", "What documents do I need?"]:
-            logger.info(f"FAQ question: {query}")
-            faq_res = client.get(token, "faq", {"query": query})
-            for item in faq_res.items:
-                logger.info(f"Answer: {item.data}")
+        step(3, "get(token, 'faq', 'How do I cancel a booking?')   -> LLM server")
+        t0 = time.monotonic()
+        res = client.get(token, "faq", {"query": "How do I cancel a booking?"})
+        show(res, client, t0)
+        print(f"    answer: {res.items[0].data if res.items else '(none)'}")
 
-        # reserve a vaccine slot
-        booking_payload = {"ticket_id": "SLOT-CVS-D1-110001", "quantity": 1, "priority": 1}
-        post_res = client.post(token, "booking", booking_payload)
-        logger.info(f"Booking status: {post_res.status} ({post_res.message})")
+        step(4, f"post(token, 'booking', {{ticket_id: {args.slot}}})")
+        t0 = time.monotonic()
+        res = client.post(token, "booking", {"ticket_id": args.slot, "quantity": 1})
+        show(res, client, t0)
+        print(f"    {res.message}")
 
-        # check updated availability
-        updated = client.get(token, "availability", {"ticket_id": "SLOT-CVS-D1-110001"})
-        for item in updated.items:
-            logger.info(f"Updated availability: {item.data}")
+        step(5, "post(token, 'assistant', 'I want the corbevax booster in Bengaluru')   -> LLM + Raft")
+        t0 = time.monotonic()
+        res = client.assistant(token, "I want the corbevax booster in Bengaluru", request_id=uuid.uuid4().hex)
+        show(res, client, t0)
+        print(f"    {res.message}")
 
-        # test business request directly
-        biz_res = client.process_business_request(
-            request_id="req-test-1",
-            payload={"action": "booking", "user_id": "alice", "ticket_id": "SLOT-CVX-D1-400001", "quantity": 1},
-        )
-        logger.info(f"Business request status: {biz_res.status} ({biz_res.message})")
+        step(6, "get(token, 'my_bookings')")
+        t0 = time.monotonic()
+        res = client.get(token, "my_bookings")
+        show(res, client, t0)
+        mine = [json.loads(i.data) for i in res.items]
+        for b in mine:
+            print(f"    {b['booking_id']:<32}{b['vaccine_name']:<12}dose {b['dose_number']}  "
+                  f"{b['center_name']:<28}{b['status']}")
 
-        logout_res = client.logout(token)
-        logger.info(f"Logout status: {logout_res.status}")
+        confirmed = [b for b in mine if b["status"] == "confirmed"]
+        if confirmed:
+            bid = confirmed[0]["booking_id"]
+            step(7, f"post(token, 'cancel', {{booking_id: {bid}}})")
+            t0 = time.monotonic()
+            res = client.post(token, "cancel", {"booking_id": bid})
+            show(res, client, t0)
+            print(f"    {res.message}")
 
+        step(8, "get(token, 'availability', SLOT)   (seat counts after the changes)")
+        res = client.get(token, "availability")
+        availability_table(res.items)
+
+        step(9, "logout(token)")
+        t0 = time.monotonic()
+        res = client.logout(token)
+        show(res, client, t0)
+        print("\nDone. Every write above appears as a COMMITTED line in all three node terminals.")
+    except grpc.RpcError:
+        sys.exit("\nCannot reach the cluster at " + args.nodes + ".\n"
+                 "Start the three node terminals first (see README: 'Run the demo in 5 terminals').")
     finally:
         client.close()
 
 
 if __name__ == "__main__":
-    h = sys.argv[1] if len(sys.argv) > 1 else "localhost"
-    p = int(sys.argv[2]) if len(sys.argv) > 2 else 50051
-    run(host=h, port=p)
-
+    main()

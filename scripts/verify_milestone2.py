@@ -9,6 +9,9 @@ Runs a sequence of checks, each printing PASS/FAIL:
   3. Five-node cluster - tolerates 2 simultaneous failures; rejoined nodes converge.
   4. Log compaction    - leader snapshots its log; a follower that missed the
                          compacted entries catches up via InstallSnapshot.
+  5. Membership        - leadership transfer; a 4th node joins via a Raft
+                         configuration entry; the leader removes itself.
+Section 1 also books and cancels in natural language through the LLM.
 
 Usage:
     python scripts/verify_milestone2.py              # all sections
@@ -174,6 +177,22 @@ def section_llm(data_dir):
         st, ans = faq(follower["client_port"], "faq-user", "How to cancel a booking?")
         check("FAQ via follower (auto-redirect)", st == "success" and ans, ans)
 
+        # Natural-language booking/cancellation, sent to a follower on purpose.
+        c, res = login(follower["client_port"], "nl-user")
+        try:
+            before = availability(lp)
+            r = c.assistant(res.token, "I need the corbevax booster in Bengaluru")
+            check("NL booking via LLM", r.status == "accepted" and "CORBEVAX" in r.message, r.message)
+            check("NL booking committed through Raft", availability(lp) == before - 1)
+            r = c.assistant(res.token, "how do I cancel a booking?")
+            check("NL question answered, nothing executed",
+                  r.status == "success" and availability(lp) == before - 1, r.message)
+            r = c.assistant(res.token, "please cancel my corbevax appointment")
+            check("NL cancellation via LLM", r.status == "success" and "Cancelled" in r.message, r.message)
+            check("NL cancellation released the slot", availability(lp) == before)
+        finally:
+            c.close()
+
         out = []
         threads = [threading.Thread(target=lambda i=i: out.append(
             faq(lp, f"c{i}", "How to cancel a booking?"))) for i in range(8)]
@@ -324,6 +343,56 @@ def section_log_compaction(data_dir):
         m.stop_all()
 
 
+def section_membership(data_dir):
+    print("\n[5] Membership change & leadership transfer (3 -> 4 -> 3 Raft nodes)")
+    spec = [dict(s) for s in DEFAULT_CLUSTER_SPEC]
+    m = new_manager(spec, data_dir, with_llm=False)
+    newbie = {"node_id": "node-4", "client_port": 50057, "raft_port": 50058, "join": True}
+    try:
+        m.start_all()
+        leader = wait_leader(spec)
+        check("leader elected", leader, leader and leader["node_id"])
+        base = availability(leader["client_port"])
+        targets = [f"localhost:{s['client_port']}" for s in spec]
+
+        target = next(s for s in spec if s is not leader)
+        admin = TicketClient.for_cluster(targets)
+        r = admin.transfer_leadership(target["node_id"])
+        st = node_status(target["client_port"])
+        check("leadership transferred on request", r.status == "success" and st and st["state"] == "leader",
+              r.message)
+        check("booking after transfer", book(target["client_port"], "after-transfer")[0] == "accepted")
+
+        m.add_node_spec(newbie)
+        m.start_node("node-4")
+        time.sleep(1.5)
+        st4 = node_status(newbie["client_port"])
+        check("joining node waits as non-voter", st4 and not st4["voting"], st4 and st4["state"])
+        r = admin.change_membership("add", "node-4", "localhost", newbie["raft_port"], newbie["client_port"])
+        check("node-4 added via config entry", r.status == "success", r.message)
+        time.sleep(1.5)
+        views = [node_status(p) for p in [s["client_port"] for s in spec] + [newbie["client_port"]]]
+        check("all 4 nodes agree on membership",
+              all(v and v["members"] == ["node-1", "node-2", "node-3", "node-4"] for v in views),
+              [v and v["members"] for v in views])
+        check("node-4 holds the replicated state",
+              len({v["state_digest"] for v in views if v}) == 1 and views[-1]["voting"])
+
+        cur = wait_leader(spec + [newbie])
+        r = admin.change_membership("remove", cur["node_id"])
+        check("leader removes itself", r.status == "success", r.message)
+        rest = [s for s in spec + [newbie] if s["node_id"] != cur["node_id"]]
+        new_leader = wait_leader(rest)
+        check("remaining 3 elect a new leader", new_leader and new_leader["node_id"] != cur["node_id"],
+              new_leader and new_leader["node_id"])
+        m.kill_node(cur["node_id"])
+        check("booking on the 3-node cluster", book(new_leader["client_port"], "after-remove")[0] == "accepted")
+        check("no booking lost across all changes", availability(new_leader["client_port"]) == base - 2)
+        admin.close()
+    finally:
+        m.stop_all()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--skip-llm", action="store_true", help="skip the LLM section")
@@ -340,6 +409,7 @@ def main():
         section_fault_tolerance(os.path.join(root, "ft"))
         section_five_nodes(os.path.join(root, "five"))
         section_log_compaction(os.path.join(root, "snap"))
+        section_membership(os.path.join(root, "member"))
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

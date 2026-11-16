@@ -6,6 +6,7 @@ import uuid
 from collections import OrderedDict
 from typing import Dict, Any, Optional
 
+from dist_ticket_booking.core.auth import check_credential
 from dist_ticket_booking.raft.log import LogEntry
 
 logger = logging.getLogger(__name__)
@@ -23,9 +24,12 @@ class StateMachine:
     committed entries, so their state converges.
     """
 
+    _RESULT_CACHE_SIZE = 1000
+
     def __init__(self, booking_service):
         self.booking_service = booking_service
         self.sessions: Dict[str, str] = {}  # token -> username (replicated)
+        self.users: Dict[str, str] = {}     # username -> password digest (replicated)
         self.last_applied: int = -1
         self._results: Dict[int, dict] = {}  # log_index -> result cache
         # Client request id -> result. A retried write (same request_id) that was
@@ -63,7 +67,7 @@ class StateMachine:
                     priority=int(cmd.get("priority", 0)),
                     # Deterministic id: every replica must assign the same
                     # booking_id so cancels still work after leader failover.
-                    booking_id=f"APPT-{cmd['ticket_id'][:12]}-{cmd['user_id'][:6]}-{entry.index}",
+                    booking_id=f"APPT-{cmd['ticket_id'][:12].rstrip('-')}-{cmd['user_id'][:6]}-{entry.index}",
                 )
             elif entry.command_type == "cancel_booking":
                 result = self.booking_service.cancel_booking(
@@ -71,9 +75,15 @@ class StateMachine:
                     booking_id=cmd["booking_id"],
                 )
             elif entry.command_type == "login":
-                token = cmd.get("token") or str(uuid.uuid4())
-                self.sessions[token] = cmd["username"]
-                result = {"status": "success", "token": token}
+                # The credential check runs here, on committed state, so every
+                # replica accepts or rejects the same login.
+                credential = cmd.get("credential")
+                if credential and not check_credential(self.users, cmd["username"], credential):
+                    result = {"status": "unauthorized", "message": "invalid username or password"}
+                else:
+                    token = cmd.get("token") or str(uuid.uuid4())
+                    self.sessions[token] = cmd["username"]
+                    result = {"status": "success", "token": token}
             elif entry.command_type == "logout":
                 token = cmd.get("token", "")
                 if token in self.sessions:
@@ -83,6 +93,11 @@ class StateMachine:
                     result = {"status": "error", "message": "Invalid token"}
             elif entry.command_type == "noop":
                 result = {"status": "success"}
+            elif entry.command_type == "config":
+                # Membership is used by the Raft layer as soon as the entry is
+                # appended; here we only report the committed outcome.
+                members = [m["node_id"] for m in cmd.get("members", [])]
+                result = {"status": "success", "message": f"cluster members: {', '.join(members)}"}
             else:
                 logger.warning(f"Unknown command type: {entry.command_type}")
                 result = {"status": "error", "message": f"Unknown command: {entry.command_type}"}
@@ -96,6 +111,7 @@ class StateMachine:
                 self._dedupe.popitem(last=False)
         self.last_applied = entry.index
         self._results[entry.index] = result
+        self._results.pop(entry.index - self._RESULT_CACHE_SIZE, None)  # keep the cache bounded
         logger.debug(f"Applied entry {entry.index} (type={entry.command_type}, term={entry.term})")
         return result
 
@@ -110,6 +126,12 @@ class StateMachine:
         bookings = {bid: b.get("status") for bid, b in bs.bookings.items()}
         blob = json.dumps([inventory, bookings], sort_keys=True).encode()
         return hashlib.sha1(blob).hexdigest()[:10]
+
+    def cached_result(self, request_id: str) -> Optional[dict]:
+        """Result of an already-applied write with this client request_id, if any."""
+        if not request_id or request_id not in self._dedupe:
+            return None
+        return dict(self._dedupe[request_id])
 
     def get_session_user(self, token: str) -> Optional[str]:
         """Look up username for a session token."""
@@ -137,6 +159,7 @@ class StateMachine:
             "ticket_store": ticket_store_data,
             "bookings": dict(self.booking_service.bookings),
             "sessions": dict(self.sessions),
+            "users": dict(self.users),
             "dedupe": dict(self._dedupe),
             "last_applied": self.last_applied,
         }
@@ -151,7 +174,12 @@ class StateMachine:
         if "bookings" in state:
             self.booking_service.bookings = state["bookings"]
         if "sessions" in state:
-            self.sessions = state["sessions"]
+            # Update in place: the gRPC servicer holds a reference to this dict.
+            self.sessions.clear()
+            self.sessions.update(state["sessions"])
+        if "users" in state:
+            self.users.clear()
+            self.users.update(state["users"])
         if "dedupe" in state:
             self._dedupe = OrderedDict(state["dedupe"])
         self.last_applied = state.get("last_applied", self.last_applied)

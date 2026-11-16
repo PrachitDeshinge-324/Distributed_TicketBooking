@@ -1,4 +1,7 @@
 """Application server handling ticket reservations and business requests."""
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "src"))
 import argparse
 import logging
 from concurrent import futures
@@ -14,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [App
 logger = logging.getLogger(__name__)
 
 
-def serve(port=50051, llm_host="localhost", llm_port=50052, local_llm=False):
+def serve(port=50051, llm_host="localhost", llm_port=50060, local_llm=False):
     booking_service = BookingService()
     local_llm_service = DomainLLM() if local_llm else None
     sessions = {}
@@ -58,7 +61,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=50051)
     parser.add_argument("--llm-host", type=str, default="localhost")
-    parser.add_argument("--llm-port", type=int, default=50052)
+    parser.add_argument("--llm-port", type=int, default=50060)
     parser.add_argument("--local-llm", action="store_true", help="Load local model fallback in App Server")
     args = parser.parse_args()
 

@@ -58,7 +58,9 @@ class ClusterManager:
     def _build_peers_str(self, current_node_id: str) -> str:
         peer_specs = []
         for n in self.nodes_spec:
-            if n["node_id"] != current_node_id:
+            # Nodes that join later are added through the Raft log, never via
+            # another node's command-line (bootstrap) membership.
+            if n["node_id"] != current_node_id and not n.get("join"):
                 peer_specs.append(f"{n['node_id']}:localhost:{n['raft_port']}:{n['client_port']}")
         return ",".join(peer_specs)
 
@@ -74,6 +76,11 @@ class ClusterManager:
             text=True,
         )
         time.sleep(1.0)
+
+    def add_node_spec(self, spec: dict):
+        """Register an extra node (e.g. one to be added with a membership change).
+        Set spec["join"] = True to start it as a non-voting joiner."""
+        self.nodes_spec = list(self.nodes_spec) + [spec]
 
     def start_node(self, node_id: str):
         spec = next((n for n in self.nodes_spec if n["node_id"] == node_id), None)
@@ -102,7 +109,7 @@ class ClusterManager:
             self.data_dir,
             "--llm-port",
             str(self.llm_port),
-        ] + self.node_args
+        ] + self.node_args + (["--join"] if spec.get("join") else [])
 
         logger.info(f"Starting node {node_id} (client:{spec['client_port']}, raft:{spec['raft_port']})...")
         proc = subprocess.Popen(cmd)

@@ -12,10 +12,17 @@ service TicketClientService {
 service TicketAppService {
   rpc ProcessBusinessRequest(BusinessRequest) returns (StatusResponse);
   rpc GetLLMAnswer(LLMQueryRequest) returns (GetLLMAnswerResponse);
+  // Cluster administration (operator tools, see scripts/cluster_admin.py)
+  rpc ChangeMembership(MembershipChangeRequest) returns (StatusResponse);
+  rpc TransferLeadership(TransferLeadershipRequest) returns (StatusResponse);
 }
 
 service LLMService {
   rpc GetLLMAnswer(LLMQueryRequest) returns (GetLLMAnswerResponse);
+  // Natural-language booking assistant: turns a citizen's sentence into a
+  // JSON intent (action, vaccine, city, dose, booking id). The answer field
+  // carries the JSON; the app server validates it before acting.
+  rpc ExtractIntent(LLMQueryRequest) returns (GetLLMAnswerResponse);
 }
 
 // ============ RAFT CONSENSUS SERVICE ============
@@ -26,6 +33,9 @@ service RaftService {
   // Log compaction (Raft paper section 7): leader ships its snapshot to a
   // follower whose next entry has already been compacted away.
   rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+  // Leadership transfer (Raft thesis 3.10): tells a caught-up follower to
+  // start an election immediately.
+  rpc TimeoutNow(TimeoutNowRequest) returns (TimeoutNowResponse);
 }
 
 // --- Messages for Client Functions ---
@@ -111,6 +121,8 @@ message RequestVoteRequest {
   int64 term = 3;            // candidate's term
   int64 last_log_index = 4;  // index of candidate's last log entry
   int64 last_log_term = 5;   // term of candidate's last log entry
+  bool pre_vote = 6;            // Pre-Vote round: receiver answers but changes no state
+  bool leadership_transfer = 7; // sent after TimeoutNow: bypasses the "leader is alive" check
 }
 
 message RequestVoteResponse {
@@ -152,6 +164,7 @@ message InstallSnapshotRequest {
   int64 last_included_index = 4;   // snapshot replaces all entries up to and including this index
   int64 last_included_term = 5;    // term of last_included_index
   string data = 6;                 // JSON-serialized state machine snapshot
+  string config_json = 7;          // cluster membership as of last_included_index
 }
 
 message InstallSnapshotResponse {
@@ -160,4 +173,31 @@ message InstallSnapshotResponse {
   int64 term = 3;                  // currentTerm, for leader to update itself
   bool success = 4;
   int64 match_index = 5;           // follower's last_included_index after install
+}
+
+message TimeoutNowRequest {
+  string from_node = 1;
+  string to_node = 2;
+  int64 term = 3;
+}
+
+message TimeoutNowResponse {
+  string from_node = 1;
+  string to_node = 2;
+  int64 term = 3;
+  bool success = 4;
+}
+
+// --- Cluster administration ---
+
+message MembershipChangeRequest {
+  string action = 1;      // "add" or "remove" (one server at a time)
+  string node_id = 2;
+  string host = 3;        // add only: address other nodes and clients use
+  int32 raft_port = 4;    // add only
+  int32 client_port = 5;  // add only
+}
+
+message TransferLeadershipRequest {
+  string target_node = 1; // empty = pick the most up-to-date follower
 }
