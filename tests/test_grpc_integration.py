@@ -10,12 +10,12 @@ from dist_ticket_booking.core.models import VaccineSlot, Ticket
 from dist_ticket_booking.grpc import ticket_service_pb2
 from dist_ticket_booking.grpc import ticket_service_pb2_grpc
 from dist_ticket_booking.grpc.service import TicketClientServicer, TicketAppServicer, LLMServicer, TicketClient
-from dist_ticket_booking.llm.domain_llm import DomainLLM
+from dist_ticket_booking.llm.domain_llm import SMALL_MODEL, DomainLLM
 
 
 @pytest.fixture(scope="module")
 def running_services():
-    llm_service = DomainLLM()
+    llm_service = DomainLLM(SMALL_MODEL)  # tests the gRPC workflow; the small model keeps it fast
     llm_server = grpc.server(concurrent.futures.ThreadPoolExecutor(max_workers=5))
     ticket_service_pb2_grpc.add_LLMServiceServicer_to_server(LLMServicer(llm_service), llm_server)
     llm_port = llm_server.add_insecure_port("[::]:0")

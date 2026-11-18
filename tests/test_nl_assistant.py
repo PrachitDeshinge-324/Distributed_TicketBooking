@@ -117,3 +117,73 @@ def test_book_and_cancel_in_natural_language_through_raft(cluster):  # noqa: F81
         assert mine == {"COVAXIN": "cancelled", "CORBEVAX": "confirmed"}
         assert n.service.get_availability("SLOT-CVX-D2-400001")["available_count"] == 25
     c.close()
+
+
+def test_assistant_conversation_follow_ups():
+    """Replies to the assistant's questions continue the request; 'none' ends it;
+    an unknown city is reported; a dose the user did not ask for is offered, not booked."""
+    svc = TicketClientServicer()  # no LLM: rule-based extraction
+    svc.Register(ticket_service_pb2.RegisterRequest(username="kim", password="pw"), None)
+    tok = svc.Login(ticket_service_pb2.LoginRequest(username="kim", password="pw"), None).token
+    n = iter(range(1000))
+
+    def say(text):
+        return svc.Post(ticket_service_pb2.PostRequest(
+            token=tok, type="assistant", data=json.dumps({"text": text}), request_id=f"r{next(n)}"), None)
+
+    res = say("book covishield at pune")
+    assert res.status == "clarify" and "no vaccination slots in Pune" in res.message
+    assert "won't book" in say("none").message
+    assert "Which dose" in say("book covishield at delhi").message
+    res = say("dose 1")                                       # follow-up completes the request
+    assert res.status == "accepted" and "COVISHIELD Dose 1" in res.message and "AIIMS Delhi" in res.message
+    res = say("book covishield dose 1 in hyderabad")          # one appointment per dose
+    assert res.status == "clarify" and "already hold a Dose 1" in res.message
+    res = say("book covishield")                              # only Dose 2 is left: offered, not booked
+    assert res.status == "clarify" and "Say 'yes'" in res.message
+    assert not any(b["dose_number"] == 2 for b in svc.booking_service.bookings.values())
+    res = say("yes")
+    assert res.status == "accepted" and "COVISHIELD Dose 2" in res.message
+    res = say("book covaxin dose 1 in hyderabad")
+    assert res.status == "clarify" and "available in: Mumbai" in res.message
+
+
+def test_information_requests_without_question_word_are_questions():
+    for text in ("difference in covishield and covaxin", "covaxin vs covishield",
+                 "tell me about corbevax", "documents needed", "covaxin gap"):
+        assert rule_based_intent(text, CITIES)["action"] == "question", text
+    assert rule_based_intent("covishield", CITIES)["action"] is None  # a bare reply, not a question
+
+
+def test_misspelt_city_centre_names_and_no_unasked_paid_booking():
+    """'banglore' and 'KEM' are understood; a slot the user did not name a vaccine for
+    (here a paid one) is offered and booked only after 'yes'; '2' answers 'which dose?'."""
+    from dist_ticket_booking.llm.intent import centre_aliases
+    svc = TicketClientServicer()
+    svc.Register(ticket_service_pb2.RegisterRequest(username="lee", password="pw"), None)
+    tok = svc.Login(ticket_service_pb2.LoginRequest(username="lee", password="pw"), None).token
+    n = iter(range(1000))
+
+    def say(text):
+        return svc.Post(ticket_service_pb2.PostRequest(
+            token=tok, type="assistant", data=json.dumps({"text": text}), request_id=f"q{next(n)}"), None)
+
+    slots = svc.booking_service.get_availability()["tickets"].values()
+    assert centre_aliases(slots)["kem"] == "Mumbai"
+    res = say("book in banglore")
+    assert res.status == "clarify" and "Say 'yes'" in res.message and "Rs.250" in res.message
+    assert not svc.booking_service.bookings                    # nothing booked or charged yet
+    assert say("yes").status == "accepted"
+    assert "Which dose" in say("book covaxin at kem").message
+    res = say("2")
+    assert res.status == "accepted" and "COVAXIN Dose 2" in res.message and "KEM" in res.message
+
+
+def test_medical_questions_are_not_answered_by_the_model():
+    from dist_ticket_booking.llm.domain_llm import _grounded
+    invented = ("The booster dose is mandatory because it must be administered at least 9 months after "
+                "completing Dose 2 to ensure adequate immune response against the current vaccine strain.")
+    out = _grounded(invented, "why booster is required")
+    assert "medical advice" in out and "9 months" in out and "strain" not in out
+    made_up = "COVAXIN is extremely effective against omicron variants and causes minimal fever reactions overall."
+    assert _grounded(made_up, "what is covaxin") != made_up    # invented content is replaced

@@ -110,13 +110,48 @@ def test_live_context_is_focused_and_unambiguous():
     from dist_ticket_booking.grpc.service import TicketClientServicer
 
     svc = TicketClientServicer(booking_service=BookingService())
-    ctx = svc._build_live_context("How many slots are left for CORBEVAX?")
+    ctx = svc._focused_availability("How many slots are left for CORBEVAX?")
     lines = [l for l in ctx.splitlines() if l.startswith("- ")]
     assert len(lines) == 1 and "CORBEVAX" in lines[0]
     assert "paid, Rs. 250" in lines[0]
-    full = svc._build_live_context("What seats are available?")
+    full = svc._focused_availability("What seats are available?")
     assert full.count("\n- ") == len(svc.booking_service.ticket_store)
-    assert svc._build_live_context("How do I cancel?") == ""
+    assert svc._focused_availability("How do I cancel?") == ""
+
+
+def test_full_state_for_the_one_page_model():
+    """The FAQ context ends with the full live state: every slot and the asking
+    citizen's own appointments; the small model's prompt drops that block."""
+    from dist_ticket_booking.business.booking_service import BookingService
+    from dist_ticket_booking.grpc.service import TicketClientServicer
+    from dist_ticket_booking.llm.domain_llm import STATE_MARKER, _without_state
+
+    svc = TicketClientServicer(booking_service=BookingService())
+    svc.booking_service.create_booking("asha", "SLOT-CVS-D1-110001")
+    ctx = svc._build_live_context("How do I cancel?", "asha")
+    focused, _, state = ctx.partition(STATE_MARKER)
+    assert focused.strip() == "" and "Today:" in state
+    assert all(sid in state for sid in svc.booking_service.ticket_store)
+    assert "COVISHIELD dose 1 at AIIMS Delhi" in state
+    assert "- none" in svc._build_live_context("hi", "ravi")
+    assert _without_state("How do I cancel?\n\nContext: " + ctx) == "How do I cancel?"
+
+
+def test_page_mode_filter_drops_only_bad_sentences():
+    from dist_ticket_booking.llm.domain_llm import DOCTOR_LINE, _page_guard
+    state = "Today: 2026-11-18\nSlots:\n- COVAXIN Dose 1 | 2027-01-12 | 30 seats open | free"
+    good = "COVAXIN is an inactivated vaccine by Bharat Biotech, given 28 days apart."
+    assert _page_guard(good, "what is covaxin", state) == good
+    assert _page_guard("The booster is given 9 months after Dose 2. This ensures adequate immunity.",
+                       "why booster", state) == "The booster is given 9 months after Dose 2. " + DOCTOR_LINE
+    assert "safe" not in _page_guard("COVAXIN is a safe vaccine.", "is covaxin safe", state).lower().replace(
+        "safety", "")
+    assert _page_guard("You can cancel within 24 hours of your appointment. Use your booking ID.",
+                       "how to cancel", state) == "Use your booking ID."
+    ok = "Cancelling is no longer possible within the last 24 hours before the start."
+    assert _page_guard(ok, "how to cancel", state) == ok
+    assert _page_guard("Call 1800-180-1104. Slots open on 2027-01-12.", "slots", state) == "Slots open on 2027-01-12."
+    assert "21" not in _page_guard("COVAXIN doses are 21 days apart.", "covaxin gap", state)
 
 
 def test_trim_incomplete_sentence():
@@ -173,3 +208,19 @@ def test_repeated_faq_is_answered_from_cache():
     changed = llm.get_llm_answer("r3", "How do I cancel?", "live data v2")["answer"]
     assert first == again == "answer 1" and len(calls) == 2 and changed == "answer 2"
     assert llm.cache_hits == 1
+
+
+def test_vaccine_questions_get_vaccine_answers():
+    """'what is covaxin' must not be answered with the dose-gap rule, and a
+    misspelt vaccine name still finds the right passage."""
+    from dist_ticket_booking.llm.domain_llm import _grounded
+    from dist_ticket_booking.llm.knowledge import retrieve
+    top = lambda q: [p.topic for p in retrieve(q)][:1]  # noqa: E731
+    assert top("what is covaxin") == ["about_covaxin"]
+    assert top("tell me about corbevax") == ["about_corbevax"]
+    assert top("what is difference in covishiel and covaxin") == ["compare"]
+    assert top("how long between covishield doses") == ["covishield"]
+    good = "COVAXIN is an inactivated COVID-19 vaccine by Bharat Biotech, given in two doses."
+    assert _grounded(good, "what is covaxin") == good        # explanation kept as written
+    assert "28 days" in _grounded("COVAXIN doses are 21 days apart.", "what is covaxin")  # invented number
+    assert "84 days" in _grounded("COVAXIN is for kids.", "covaxin vs covishield")         # exact passage

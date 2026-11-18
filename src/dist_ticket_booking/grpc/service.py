@@ -18,12 +18,17 @@ from dist_ticket_booking.core.auth import (
     DEFAULT_ADMIN_CODE, ROLE_ADMIN, ROLE_CITIZEN, ROLES, admin_signup_code, credential_digest,
     register_user, role_of, validate_username, verify_credential,
 )
-from dist_ticket_booking.llm.domain_llm import DomainLLM, _keyword_fallback
+from dist_ticket_booking.llm.domain_llm import STATE_MARKER, DomainLLM, _keyword_fallback
 from dist_ticket_booking.llm.intent import (
-    intent_context, known_cities, merge, parse_llm_json, resolve, rule_based_intent,
+    centre_aliases, choose_message, continue_intent, find_slot_id, intent_context, is_bare_reply, is_dismissal, known_cities,
+    merge, parse_llm_json, raw_llm_city, resolve, rule_based_intent, slot_city, unknown_place,
 )
 
 logger = logging.getLogger(__name__)
+
+# "yes" / "book it" in reply to the assistant's question confirms the pending request.
+_CONFIRM_RE = re.compile(r"^\s*(yes|yeah|yep|yup|ok|okay|sure|confirm|go ahead|please do|do it|book it|"
+                         r"yes please|that one|this one)\s*[.!]*\s*$", re.I)
 
 # Deadline for app-server -> LLM-server RPCs. If the model is slower than
 # this (e.g. CPU-only inference), clients get a keyword-based answer instead
@@ -142,6 +147,12 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
         self.llm_service = llm_service
         self._users: Dict[str, dict] = {}  # standalone (non-Raft) mode only
         self._tl = threading.local()  # per-request info for log lines (answer source)
+        # Assistant conversations: the request each user is being asked to complete
+        # ("which dose?"), so a reply like "delhi" or "dose 1" continues it. Kept on
+        # the serving node only; it shapes how a sentence is read, never the
+        # replicated state, so losing it on failover just means asking again.
+        self._pending: Dict[str, tuple] = {}
+        self._pending_lock = threading.Lock()
 
     def _verify_token(self, token: str) -> Optional[str]:
         if self.raft_node is not None:
@@ -332,7 +343,7 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
             elif request.type == "faq":
                 params = json.loads(request.params) if request.params else {}
                 query = params.get("query", request.params or "")
-                live_context = self._build_live_context(query)
+                live_context = self._build_live_context(query, user_id)
                 t0 = time.monotonic()
                 answer = self._query_llm(query, live_context)
                 logger.info(f"FAQ    user '{user_id}': {query!r} -> answered in {time.monotonic() - t0:.1f}s "
@@ -372,7 +383,10 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
                 answer = res.answer
             else:
                 answer = self.llm_service.extract_intent(str(uuid.uuid4()), text, allowed)["answer"]
-            return parse_llm_json(answer, cities)
+            out = parse_llm_json(answer, cities)
+            if out:
+                out["_raw_city"] = raw_llm_city(answer)  # reported if it has no centre ("Pune")
+            return out
         except Exception as e:
             logger.warning(f"Intent extraction via LLM failed ({e}); using rule-based extraction")
             return {}
@@ -422,21 +436,73 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
             if prior is not None:
                 return done(prior)
 
+        pending = self._take_pending(user_id)
+        if is_dismissal(text):
+            logger.info(f"ASSIST user '{user_id}': {text!r} -> DISMISS")
+            return reply("success", "OK, I won't book or cancel anything. Tell me when you need something."
+                         if pending else "OK. Tell me what you would like to book or cancel.")
+
         slots = self.booking_service.get_availability().get("tickets", {})
         mine = {bid: b for bid, b in self.booking_service.bookings.items() if b.get("user_id") == user_id}
         cities = known_cities(slots.values())
-        rules = rule_based_intent(text, cities)
-        llm = self._extract_intent_llm(text, intent_context(slots.values()), cities)
+        centres = centre_aliases(slots.values())
+        rules = rule_based_intent(text, cities, centres)
+        slot_id = find_slot_id(text, slots)
+        confirm = bool(pending and _CONFIRM_RE.match(text))
+        # A single unknown word after "which city?" is a place we have no centre in ("pune").
+        word_place = (text.strip().title() if pending and not confirm and not slot_id
+                      and re.fullmatch(r"[A-Za-z]{3,}", text.strip()) and not any(rules.values()) else None)
+        bare = confirm or bool(word_place) or is_bare_reply(text, rules, slot_id)
+        # The model's intent is not needed when this is a reply to the assistant's question,
+        # or when the rules already see a question (merge() would keep "question" anyway).
+        skip_llm = (bare and pending) or rules["action"] == "question"
+        llm = {} if skip_llm else self._extract_intent_llm(text, intent_context(slots.values()), cities)
         intent = merge(llm, rules, text)
-        plan = resolve(intent, slots, mine)
-        understood = ", ".join(f"{k}={v}" for k, v in intent.items() if v is not None) or "nothing"
-        logger.info(f"ASSIST user '{user_id}': {text!r} -> understood [{understood}] "
-                    f"({'LLM' if llm else 'keyword rules'}) -> {plan['kind'].upper()}")
+        place = word_place or (None if intent.get("city") else unknown_place(text, cities, llm.get("_raw_city"), centres))
+        # Naming a (different) vaccine, a booking ID or a slot starts a new request.
+        fresh = not bare and any(intent.get(k) for k in ("vaccine", "booking_id")) or bool(slot_id and not bare)
+        if pending and not fresh and (bare or (rules["action"] in (None, pending["action"])
+                                               and intent["action"] == pending["action"])):
+            # A reply to the assistant's question ("delhi", "dose 1", "yes", "book dose 2"):
+            # complete the pending request with what this message adds.
+            intent = continue_intent(pending, rules if bare else intent)
+            if place:
+                intent["city"] = None  # "at pune" replaces the earlier city
+        elif bare:
+            intent["action"] = "browse"  # "delhi" out of the blue: show the slots, don't book
+
+        if intent["action"] in ("book", "browse") and place:
+            plan = {"kind": "clarify", "message": (
+                f"There are no vaccination slots in {place}. Slots are available in {', '.join(cities)}. "
+                f"Which city would you like? (Say 'none' to stop.)")}
+        elif confirm and pending.get("offer_slot"):
+            plan = {"kind": "book", "slot_id": pending["offer_slot"]}   # "yes" to the offered slot
+        elif intent["action"] in ("book", "browse") and slot_id:
+            plan = ({"kind": "book", "slot_id": slot_id} if intent["action"] == "book" or pending
+                    else {"kind": "clarify", "message": f"Do you want to book {slots[slot_id]['name']} "
+                          f"({slot_id})? Say 'book {slot_id}' to confirm."})
+        elif intent["action"] == "browse":
+            plan = self._browse(intent, slots)
+        else:
+            plan = resolve(intent, slots, mine)
+        if plan["kind"] == "book" and not intent.get("vaccine") and not slot_id and not confirm:
+            # The user never named a vaccine ("book in Bangalore"): one slot matching is
+            # not consent to book (and maybe pay for) it. Offer it and wait for "yes".
+            plan = {"kind": "clarify", "offer_slot": plan["slot_id"],
+                    "message": choose_message(intent, {plan["slot_id"]: slots[plan["slot_id"]]})}
+        if plan["kind"] == "clarify" and intent["action"] in ("book", "cancel", "browse"):
+            self._set_pending(user_id, {**intent, "action": "cancel" if intent["action"] == "cancel" else "book",
+                                        "offer_slot": plan.get("offer_slot")})
+
+        understood = ", ".join(f"{k}={v}" for k, v in intent.items() if v is not None and not k.startswith("_"))
+        logger.info(f"ASSIST user '{user_id}': {text!r} -> understood [{understood or 'nothing'}] "
+                    f"({'follow-up' if bare and pending else 'LLM' if llm else 'keyword rules'}) "
+                    f"-> {plan['kind'].upper()}")
 
         if plan["kind"] == "clarify":
             return reply("clarify", plan["message"])
         if plan["kind"] == "question":
-            return reply("success", self._query_llm(text, self._build_live_context(text)))
+            return reply("success", self._query_llm(text, self._build_live_context(text, user_id)))
 
         if plan["kind"] == "book":
             return done(self._execute("create_booking", {
@@ -447,16 +513,66 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
             "user_id": user_id, "booking_id": plan["booking_id"], "request_id": request_id,
         }))
 
+    _PENDING_TTL_S = 300  # a reply after 5 minutes starts a new conversation
+
+    def _take_pending(self, user_id: str) -> Optional[dict]:
+        with self._pending_lock:
+            entry = self._pending.pop(user_id, None)
+        if entry and time.monotonic() - entry[1] < self._PENDING_TTL_S:
+            return entry[0]
+        return None
+
+    def _set_pending(self, user_id: str, intent: dict):
+        with self._pending_lock:
+            self._pending[user_id] = ({k: v for k, v in intent.items() if not k.startswith("_")}, time.monotonic())
+
+    @staticmethod
+    def _browse(intent: dict, slots: Dict[str, dict]) -> dict:
+        """List open slots for a bare "delhi" / "covaxin" without booking anything."""
+        def ok(s):
+            return ((not intent.get("vaccine") or s.get("vaccine_name") == intent["vaccine"])
+                    and (not intent.get("dose") or int(s.get("dose_number") or 0) == intent["dose"])
+                    and (not intent.get("city") or slot_city(s) == intent["city"])
+                    and int(s.get("available_count", 0)) > 0)
+        found = {sid: s for sid, s in slots.items() if ok(s)}
+        if not found:
+            return {"kind": "clarify", "message": "No open slots match that. Try another city or vaccine."}
+        return {"kind": "clarify", "message": choose_message(intent, found),
+                "offer_slot": next(iter(found)) if len(found) == 1 else None}
+
     # Keywords that indicate the user is asking about live inventory
     _AVAILABILITY_KEYWORDS = (
         "available", "availability", "seat", "slot", "how many",
         "remaining", "left", "count", "vacant", "open", "book",
     )
 
-    def _build_live_context(self, query: str) -> str:
-        """Return a plain-text summary of live slot inventory if the query
-        seems to be about availability; otherwise return an empty string.
-        """
+    def _build_live_context(self, query: str, user_id: Optional[str] = None) -> str:
+        """Live context for an FAQ: the focused availability summary (when the
+        question is about availability) followed by the full live state after
+        STATE_MARKER. The small model uses only the first part; the larger
+        model reads the full state as its one page of live data."""
+        return f"{self._focused_availability(query)}\n{STATE_MARKER}\n{self._full_state(user_id)}".strip()
+
+    def _full_state(self, user_id: Optional[str]) -> str:
+        """Every slot and the asking citizen's appointments, from Raft-replicated state."""
+        from datetime import datetime
+        from dist_ticket_booking.business.booking_service import IST
+        lines = [f"Today: {datetime.now(IST).strftime('%Y-%m-%d')}", "Slots:"]
+        for sid, s in sorted(self.booking_service.get_availability().get("tickets", {}).items()):
+            price = "free" if not s.get("price") else f"Rs.{float(s['price']):.0f}"
+            seats = f"{s.get('available_count', 0)} seats open" if s.get("available_count", 0) > 0 else "SOLD OUT"
+            lines.append(f"- {s.get('name', sid)} | {sid} | dose {s.get('dose_number')} | {s.get('date')} "
+                         f"{s.get('time')} | {seats} | {price}")
+        mine = [b for b in self.booking_service.bookings.values()
+                if user_id and b.get("user_id") == user_id and b.get("status") == "confirmed"]
+        lines.append("This citizen's appointments:")
+        lines += [f"- {b['booking_id']}: {b['vaccine_name']} dose {b['dose_number']} at {b['center_name']} on "
+                  f"{b['scheduled_date']} {b.get('scheduled_time', '')}" for b in mine] or ["- none"]
+        return "\n".join(lines)
+
+    def _focused_availability(self, query: str) -> str:
+        """A plain-text summary of live slot inventory if the query seems to
+        be about availability; otherwise an empty string."""
         q = query.lower()
         if not any(kw in q for kw in self._AVAILABILITY_KEYWORDS):
             return ""

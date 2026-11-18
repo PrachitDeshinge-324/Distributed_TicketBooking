@@ -37,7 +37,8 @@ def serve(port=50060, model_name=DEFAULT_MODEL):
         raise SystemExit(f"ERROR: port {port} is already in use. Is the LLM server already running?")
     server.start()
     print("=" * 78)
-    print(f"  AI / LLM SERVER   model={model_name} on {llm_service.device}"
+    mode = "one-page context" if getattr(llm_service, "page_mode", False) else "retrieved passages"
+    print(f"  AI / LLM SERVER   model={llm_service.model_name} on {llm_service.device}  ({mode})"
           f"{'' if llm_service._pipeline else '  (model not loaded: keyword fallback)'}")
     print(f"  listening on :{port}  (GetLLMAnswer for FAQs, ExtractIntent for plain-English bookings)")
     print("=" * 78, flush=True)
@@ -53,7 +54,9 @@ def serve(port=50060, model_name=DEFAULT_MODEL):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=50060)
-    parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
+                        help="'auto' (default): Qwen3.5-2B on CUDA / Apple Silicon, Qwen3.5-0.8B on CPU; "
+                             "or a HuggingFace model id. The LLM_MODEL environment variable overrides it.")
     args = parser.parse_args()
 
     serve(port=args.port, model_name=args.model)

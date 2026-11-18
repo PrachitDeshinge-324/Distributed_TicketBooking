@@ -13,7 +13,8 @@ Normally you use the wrappers instead: run_demo.bat (Windows), run_demo.sh
 What `start` does
   1. creates a private virtual environment in .demo_venv (your own Python
      packages are never touched) and installs the requirements into it,
-  2. downloads the LLM (Qwen3.5-0.8B, about 1.6 GB) into the Hugging Face cache,
+  2. downloads the LLM into the Hugging Face cache (Qwen3.5-2B, about 4.5 GB, on
+     Apple Silicon / NVIDIA GPUs; Qwen3.5-0.8B, about 1.6 GB, otherwise),
   3. opens five terminals and starts, one per terminal:
        T1 LLM server | T2, T3, T4 Raft nodes | T5 client walkthrough, then
        the automatic leader-failure test (scripts/failover_demo.py)
@@ -44,7 +45,7 @@ OS_NAME = "windows" if IS_WIN else ("macos" if sys.platform == "darwin" else "li
 
 LLM_PORT = 50060
 NODES = [("node-1", 50051, 50052), ("node-2", 50053, 50054), ("node-3", 50055, 50056)]
-MODEL = "Qwen/Qwen3.5-0.8B"
+SMALL_MODEL, LARGE_MODEL = "Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B"  # see llm/domain_llm.py
 LLM_PACKAGES = ("torch", "transformers")
 
 
@@ -93,6 +94,7 @@ def demo_env() -> dict:
     env = clean_env()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    env.setdefault("GRPC_VERBOSITY", "ERROR")  # hide gRPC's INFO chatter (e.g. fork notices)
     return env
 
 
@@ -191,12 +193,18 @@ def setup(args) -> Path:
     if run([py, "-c", "import grpc, google.protobuf"]) != 0:
         sys.exit("The environment is broken. Delete the .demo_venv folder and run again.")
     if want_llm and llm_ok and not args.no_model:
-        step(f"LLM model {MODEL} (downloaded once, then cached offline)")
+        step("LLM model (downloaded once, then cached offline)")
+        # Same choice as the LLM server's 'auto': 2B on a GPU / Apple Silicon, else 0.8B.
         code = (
+            "import os, torch\n"
             "from huggingface_hub import snapshot_download as d\n"
-            f"m = {MODEL!r}\n"
+            "gpu = torch.cuda.is_available() or (getattr(torch.backends, 'mps', None) is not None "
+            "and torch.backends.mps.is_available())\n"
+            f"m = os.environ.get('LLM_MODEL') or ({LARGE_MODEL!r} if gpu else {SMALL_MODEL!r})\n"
+            "size = '~4.5 GB' if m.endswith('2B') else '~1.6 GB'\n"
+            "print('Model:', m)\n"
             "try:\n    d(m, local_files_only=True); print('Model already cached.')\n"
-            "except Exception:\n    print('Downloading ~1.6 GB, please wait ...'); d(m); print('Model ready.')\n"
+            "except Exception:\n    print(f'Downloading {size}, please wait ...'); d(m); print('Model ready.')\n"
         )
         if run([py, "-c", code], env=demo_env()) != 0:
             say("WARNING: could not download the model (offline?). The LLM node starts anyway "
@@ -216,38 +224,91 @@ def build_terminals(py: str, fresh: bool, with_llm: bool, windows: bool = True):
     terms = []
     if with_llm:
         terms.append(("T1 LLM server (node 1)", [[me, "scripts/run_llm_server.py"]],
-                      "python scripts/run_llm_server.py"))
+                      "python scripts/run_llm_server.py", None))
     for i, (nid, cport, rport) in enumerate(NODES):
         base = [me, "scripts/run_node.py", "--node-id", nid, "--client-port", str(cport),
                 "--raft-port", str(rport), "--peers", peers_arg(nid)]
         keep = "python scripts/run_node.py " + " ".join(quote(a) for a in base[2:])
+        # After the node process ends, the same window waits and restarts it from its
+        # saved data (no --fresh) when the failover test asks, so no extra windows open.
         terms.append((f"T{i + 2} Raft node {nid}", [base + (["--fresh"] if fresh else [])],
-                      f"{keep}   (same command, without --fresh, restarts this node with its saved data)"))
+                      f"{keep}   (same command, without --fresh, restarts this node with its saved data)",
+                      (nid, base)))
     client = [[me, "scripts/demo_launcher.py", "wait"] + ([] if with_llm else ["--no-llm"]),
               [me, "scripts/client_demo.py"],
               # Crashes the leader automatically, restarts it, prints PASS/FAIL checks.
-              [me, "scripts/failover_demo.py", "--restart", "window" if windows else "background"]]
+              [me, "scripts/failover_demo.py", "--restart", "same" if windows else "background"]]
     terms.append(("T5 client (node 5)", client,
                   "python scripts/failover_demo.py | python scripts/client.py --help | "
-                  "python scripts/assistant.py"))
+                  "python scripts/assistant.py", None))
     return terms
 
 
-def script_text(title, cmds, hint):
-    """Contents of the per-terminal script for this OS."""
+def restart_request_file(nid: str) -> Path:
+    """failover_demo.py creates this to ask the node's own window to restart it."""
+    return RUN_DIR / f"restart_{nid}.request"
+
+
+def restart_waiting_file(nid: str) -> Path:
+    """Exists while a node's window is waiting to restart it (its process has ended)."""
+    return RUN_DIR / f"waiting_{nid}"
+
+
+def script_text(title, cmds, hint, restart=None):
+    """Contents of the per-terminal script for this OS.
+
+    restart=(node_id, argv): when the program ends, keep the window and rerun argv
+    (the node without --fresh) whenever failover_demo.py requests it.
+    """
     if OS_NAME == "windows":
         L = ["@echo off", "chcp 65001 >nul", "set PYTHONHOME=", "set PYTHONPATH=", "set PYTHONUSERBASE=",
-             "set PYTHONNOUSERSITE=1", "set PYTHONUTF8=1", "set PYTHONIOENCODING=utf-8",
+             "set PYTHONNOUSERSITE=1", "set PYTHONUTF8=1", "set PYTHONIOENCODING=utf-8", "set GRPC_VERBOSITY=ERROR",
              f"title {title}", f'cd /d "{ROOT}"', f'call "{venv_bin() / "activate.bat"}"' if VENV.exists() else "rem"]
         L += [" ".join(quote(a) for a in c) for c in cmds]
+        if restart:
+            nid, argv = restart
+            req, wait = restart_request_file(nid), restart_waiting_file(nid)
+            L += [":wait_restart", f'type nul > "{wait}"', "echo.",
+                  "echo ------------------------------------------------------------------",
+                  f"echo  {nid} stopped. This window restarts it from its saved data when",
+                  "echo  the failover test asks. Close the window to stop for good.",
+                  "echo ------------------------------------------------------------------",
+                  ":poll_restart", f'if exist "{req}" goto do_restart',
+                  "timeout /t 1 /nobreak >nul", "goto poll_restart",
+                  ":do_restart", f'del "{req}" "{wait}" 2>nul', "echo.",
+                  f"echo === restarting {nid} from its saved data (no --fresh) ===",
+                  " ".join(quote(a) for a in argv), "goto wait_restart"]
         L += ["echo.", "echo ------------------------------------------------------------------",
               "echo  Process ended. This window stays open - run it again with:",
               f"echo    {hint}".replace("|", "^|"), "echo ------------------------------------------------------------------"]
         return "\r\n".join(L) + "\r\n"
     L = ["#!/usr/bin/env bash", "unset PYTHONHOME PYTHONPATH PYTHONUSERBASE",
          "export PYTHONUTF8=1 PYTHONIOENCODING=utf-8 PYTHONNOUSERSITE=1",
+         "export GRPC_VERBOSITY=ERROR",
          f"printf '\\033]0;%s\\007' {quote(title)}", f"cd {quote(str(ROOT))}", "trap : INT   # Ctrl+C stops the program, not this script (the window stays open)"]
     L += [" ".join(quote(a) for a in c) for c in cmds]
+    if restart:
+        nid, argv = restart
+        req, wait = quote(str(restart_request_file(nid))), quote(str(restart_waiting_file(nid)))
+        L += ["while :; do",
+              f"  touch {wait}",
+              "  echo",
+              "  echo '------------------------------------------------------------------'",
+              f"  echo ' {nid} stopped. This window restarts it from its saved data when'",
+              "  echo ' the failover test asks.  Enter = restart now,  q + Enter = stop.'",
+              "  echo '------------------------------------------------------------------'",
+              "  answer=",
+              f"  while [ ! -f {req} ]; do",
+              "    read -r -t 1 answer; rc=$?",
+              "    [ $rc -eq 0 ] && break",
+              "    [ $rc -gt 128 ] || sleep 1   # stdin closed: keep polling without spinning",
+              "  done",
+              f"  rm -f {req} {wait}",
+              '  [ "$answer" = q ] && break',
+              "  echo",
+              f"  echo '=== restarting {nid} from its saved data (no --fresh) ==='",
+              "  " + " ".join(quote(a) for a in argv),
+              "done"]
     L += [f"export PATH={quote(str(venv_bin()))}:\"$PATH\"", "echo",
           "echo '------------------------------------------------------------------'",
           "echo ' Process ended. This window stays open - run it again with:'",
@@ -259,10 +320,14 @@ def script_text(title, cmds, hint):
 def write_scripts(terms):
     RUN_DIR.mkdir(exist_ok=True)
     paths = []
-    for i, (title, cmds, hint) in enumerate(terms):
+    # Forget restart signals and old restart scripts from a previous run.
+    for pattern in ("restart_*.request", "waiting_*", "restart_*.sh", "restart_*.bat"):
+        for old in RUN_DIR.glob(pattern):
+            old.unlink(missing_ok=True)
+    for i, (title, cmds, hint, restart) in enumerate(terms):
         p = RUN_DIR / f"terminal_{i + 1}{'.bat' if IS_WIN else '.sh'}"
         with open(p, "w", newline="") as f:
-            f.write(script_text(title, cmds, hint))
+            f.write(script_text(title, cmds, hint, restart))
         if not IS_WIN:
             p.chmod(0o755)
         paths.append(p)
@@ -358,7 +423,7 @@ def start_background(py, args, with_llm):
     procs = []
     extra = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if IS_WIN else {"start_new_session": True}
     say("Starting in the background. Logs: " + str(logs))
-    for i, (title, cmds, _) in enumerate(terms[:-1], 1):
+    for i, (title, cmds, *_) in enumerate(terms[:-1], 1):
         name = f"terminal_{i}"
         f = open(logs / f"{name}.log", "w", encoding="utf-8")
         procs.append(subprocess.Popen(cmds[0], cwd=ROOT, env=demo_env(), stdout=f, stderr=subprocess.STDOUT, **extra))
@@ -431,7 +496,7 @@ def cmd_start(args):
         return start_background(py, args, with_llm)
     say(f"\nOpened {len(terms)} terminals: " + ", ".join(t[0] for t in terms))
     say("T5 waits for the cluster, walks through every client function, then crashes the leader "
-        "automatically and prints PASS/FAIL checks (a new window opens for the restarted node).")
+        "automatically and prints PASS/FAIL checks (the crashed node restarts in its own window).")
     say("Stop the demo by pressing Ctrl+C / closing the windows. Re-running this launcher "
         "starts it again.")
 

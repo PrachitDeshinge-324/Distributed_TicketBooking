@@ -40,6 +40,20 @@ def test_one_appointment_per_citizen_per_slot():
     assert s.create_booking("ravi", FREE)["status"] == "accepted"  # other citizens are fine
 
 
+def test_one_appointment_per_citizen_per_dose_at_any_centre():
+    """Same dose elsewhere is refused just like the same slot; other doses are fine."""
+    s = VaccinationService()
+    assert s.create_booking("asha", "SLOT-CVS-D1-110001")["status"] == "accepted"   # Dose 1, Delhi
+    elsewhere = s.create_booking("asha", "SLOT-CVS-D1-500001")                       # Dose 1, Hyderabad
+    assert elsewhere["status"] == "rejected" and "Dose 1" in elsewhere["message"]
+    other_vaccine = s.create_booking("asha", "SLOT-CVX-D1-400001")                   # COVAXIN Dose 1
+    assert other_vaccine["status"] == "rejected"
+    assert s.create_booking("asha", "SLOT-CVS-D2-110001")["status"] == "accepted"   # Dose 2 is fine
+    bid = next(b for b, v in s.bookings.items() if v["ticket_id"] == "SLOT-CVS-D1-110001")
+    assert s.cancel_booking("asha", bid)["status"] in ("success", "accepted")
+    assert s.create_booking("asha", "SLOT-CVS-D1-500001")["status"] == "accepted"   # after cancelling
+
+
 def test_a_booking_is_for_one_person():
     s = VaccinationService()
     res = s.create_booking("asha", FREE, quantity=2)

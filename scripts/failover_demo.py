@@ -7,14 +7,15 @@ run_demo.bat / run_demo.sh, or by hand in terminals T2-T4):
   2. starts concurrent users (book / cancel / availability) on the client node
   3. after a few seconds CRASHES the current leader (kill -9 / taskkill /F)
   4. measures how long the two survivors take to elect a new leader
-  5. restarts the crashed node from its saved data (new window, or in the
-     background); it rejoins as a follower and catches up
+  5. restarts the crashed node from its saved data (in its own terminal window,
+     a new window, or in the background); it rejoins as a follower and catches up
   6. audits the result: no overbooking, no lost update, all replicas identical
   7. prints a checklist with PASS / FAIL for each point
 
     python scripts/failover_demo.py
     python scripts/failover_demo.py --users 10 --duration 30
-    python scripts/failover_demo.py --restart background   # no new window for the restarted node
+    python scripts/failover_demo.py --restart window       # open a new window for the restarted node
+    python scripts/failover_demo.py --restart background   # no window for the restarted node
     python scripts/failover_demo.py --restart none         # print the restart command instead
 
 Crashing a process only works for nodes on this machine.
@@ -32,6 +33,7 @@ import time
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
+os.environ.setdefault("GRPC_VERBOSITY", "ERROR")  # before importing grpc: hide its INFO notices
 
 import grpc  # noqa: E402
 
@@ -41,7 +43,8 @@ COLOR = setup_console()
 from dist_ticket_booking.grpc import ticket_service_pb2 as pb  # noqa: E402
 from dist_ticket_booking.grpc import ticket_service_pb2_grpc as stubs  # noqa: E402
 from scripts.demo_launcher import (  # noqa: E402
-    IS_WIN, NODES, RUN_DIR, demo_env, open_terminals, peers_arg, script_text,
+    IS_WIN, NODES, RUN_DIR, demo_env, open_terminals, peers_arg, restart_request_file,
+    restart_waiting_file, script_text,
 )
 from scripts.run_clients import Stats, fetch_availability, user_session  # noqa: E402
 
@@ -112,6 +115,22 @@ def restart(nid, mode):
     if mode == "none":
         say(f"  restart it yourself (same command, no --fresh):\n    {shown}")
         return
+    if mode == "same":
+        # The node's own terminal (from the demo launcher) waits after its process
+        # ends; ask it to rerun the node there instead of opening another window.
+        if restart_waiting_file(nid).exists():
+            restart_request_file(nid).write_text(str(time.time()))
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if node_status(cport) is not None:
+                    say(f"  restarted {nid} in its own terminal window (same command, without --fresh)")
+                    return
+                time.sleep(0.3)
+            restart_request_file(nid).unlink(missing_ok=True)
+            say(f"  {nid}'s window did not restart it; restarting in the background instead")
+        else:
+            say(f"  no waiting terminal for {nid}; restarting in the background instead")
+        mode = "background"
     RUN_DIR.mkdir(exist_ok=True)
     if mode == "window":
         title = f"{nid} (restarted after crash)"
@@ -150,8 +169,9 @@ def main():
     ap.add_argument("--duration", type=float, default=20.0, help="seconds of client load")
     ap.add_argument("--kill-at", type=float, default=5.0, help="seconds into the load to crash the leader")
     ap.add_argument("--restart-at", type=float, default=10.0, help="seconds into the load to restart it")
-    ap.add_argument("--restart", choices=("window", "background", "none"), default="window",
-                    help="how to restart the crashed node (default: a new terminal window)")
+    ap.add_argument("--restart", choices=("same", "window", "background", "none"), default="same",
+                    help="how to restart the crashed node (default: in its own terminal window "
+                         "when started by the demo launcher, otherwise in the background)")
     args = ap.parse_args()
     logging.disable(logging.WARNING)
     checks = []
