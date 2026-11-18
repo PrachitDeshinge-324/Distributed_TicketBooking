@@ -13,7 +13,9 @@ Our project implements an end-to-end distributed ticket booking platform that gu
 1. **gRPC inter-service communication** for low-latency, typed RPC calls.
 2. **Raft Consensus Protocol** across application server nodes for leader election, log replication, and failure recovery.
 3. **Domain-Specific AI/LLM Server** running on an independent node to answer FAQs and to turn plain-English requests into bookings and cancellations.
-4. **Replicated State Machine** ensuring slot inventory and user sessions remain consistent across all surviving replicas.
+4. **Replicated State Machine** ensuring slot inventory, bookings, payments and user sessions remain consistent across all surviving replicas.
+
+The booking rules are enforced inside that state machine, so every replica applies them identically: one appointment per citizen per dose (at any centre), cancellation until 24 hours before the appointment with any fee refunded, a mock payment gateway for paid slots (a declined payment rejects the booking and leaves the seat open), and `citizen` / `admin` roles. The system runs as five nodes (an LLM node, three Raft application nodes and a client node) and starts with one command (`run_demo.bat` on Windows, `bash run_demo.sh` on macOS and Linux).
 
 ---
 
@@ -26,10 +28,10 @@ We are a two-member team. Rather than splitting the work by milestone, we split 
 | | Milestone 1 | Milestone 2 |
 |---|---|---|
 | **Communication** | Wrote the protobuf contract (`ticket_service.proto`) for the client, application and LLM services; built the gRPC server bootstrap | Added the Raft service (`RequestVote`, `AppendEntries`, `InstallSnapshot`, `TimeoutNow`) and the admin RPCs; leader-following, election-aware `TicketClient` (redirects, back-off, seed rotation) |
-| **Sessions** | Login/logout flow and session tokens | Made sessions part of the replicated state so a token works on any node after failover |
+| **Sessions** | Login/logout flow and session tokens | Made sessions part of the replicated state so a token works on any node after failover; `Register` RPC and `citizen` / `admin` roles |
 | **Consensus** | — | `RaftNode`: randomized election timeouts, Pre-Vote, election restriction, log replication with conflict truncation, commit rules and the leader no-op, CheckQuorum and the read lease |
 | **Durability** | — | Crash-safe stable storage (atomic `fsync` + rename), commit-safe restart, log compaction and `InstallSnapshot` |
-| **Cluster operations** | — | Single-server membership changes, leadership transfer, `run_node.py --join`, `run_cluster.py`, `cluster_admin.py`, `monitor_cluster.py` |
+| **Cluster operations** | — | Single-server membership changes, leadership transfer, `run_node.py --join`, `run_cluster.py`, `cluster_admin.py` (status, kill-leader, transfer, add, remove), `monitor_cluster.py` |
 | **Testing** | gRPC integration tests | Raft unit tests, partition fault injection (`set_partition`) and the partition / membership / Pre-Vote test suites |
 
 **Key learnings**
@@ -41,12 +43,12 @@ We are a two-member team. Rather than splitting the work by milestone, we split 
 
 | | Milestone 1 | Milestone 2 |
 |---|---|---|
-| **Booking logic** | Vaccine-slot inventory, booking and cancellation, per-slot locks against race conditions, mock payment | Made booking deterministic so every replica produces identical results (booking IDs derived from the log index) |
+| **Booking logic** | Vaccine-slot inventory, booking and cancellation, per-slot locks against race conditions, mock payment | Made booking deterministic so every replica produces identical results (booking IDs derived from the log index); enforced the booking rules in the state machine (one appointment per citizen per dose, 24-hour cancellation cutoff) |
 | **State machine** | — | `StateMachine`: applies committed entries, exactly-once de-duplication by `request_id`, snapshot/restore of the business state, state digest for replica comparison |
-| **Authentication** | Credential checks at login | Salted password hashing with the check run inside the replicated state machine, so every replica agrees and no plain-text password enters the log |
-| **LLM server** | Standalone Qwen3.5-0.8B server with batched inference, domain policy prompt and keyword fallback | Live Raft data as context, grounding guardrails for policy numbers and seat counts, back-pressure and timeouts so a slow model never blocks bookings |
-| **Natural-language booking** | — | Intent extraction on the LLM server, validation and grounding of the model output, resolution against live slots and the user's bookings, `assistant.py` |
-| **Load and demos** | Concurrency demo | Client node with consistency audit (`run_clients.py`), stress tests, 5-node demo, `verify_milestone2.py` |
+| **Authentication** | Credential checks at login | Salted PBKDF2 password hashing with the check run inside the replicated state machine, so every replica agrees and no plain-text password enters the log; `citizen` / `admin` roles, with admin sign-up protected by a cluster code |
+| **LLM server** | Standalone Qwen3.5-0.8B server with batched inference, domain policy prompt and keyword fallback | Qwen3.5-2B on a GPU or Apple Silicon (0.8B fallback on CPU), one-page prompt of policies plus live Raft state, sentence-level guardrail (invented numbers or contact details, inverted cancellation deadline, medical claims), back-pressure and timeouts so a slow model never blocks bookings |
+| **Natural-language booking** | — | Intent extraction on the LLM server, validation and grounding of the model output, resolution against live slots and the user's bookings, `assistant.py`; follow-up replies ("delhi", "dose 1", "yes"), misspelt cities and centre names, offering matching vaccines before booking |
+| **Load and demos** | Concurrency demo | Mock payment gateway (`payment.py`), client node with consistency audit (`run_clients.py`), stress tests, 5-node demo, automatic failover demo, one-command launcher, `verify_milestone2.py` |
 
 **Key learnings**
 - A replicated state machine must be completely deterministic: anything random or time-based (our early booking IDs used `uuid4`) makes replicas diverge silently.
@@ -55,7 +57,7 @@ We are a two-member team. Rather than splitting the work by milestone, we split 
 
 ### Joint work
 - Designing the boundary between the two layers (`propose()` → log entry → `apply()`), the request/response formats and the error statuses (`redirect`, `unavailable`, `clarify`).
-- Debugging failover and partition scenarios together, reviewing each other's code, the README, and the demo video.
+- Debugging failover and partition scenarios together, reviewing each other's code, the README, and the live demo.
 
 ---
 
@@ -101,12 +103,37 @@ We are a two-member team. Rather than splitting the work by milestone, we split 
    - *Challenge*: Rules such as "cancellation closes 24 hours before the appointment" depend on the current time, but replicas apply a committed entry at different moments (a restarted node replays it much later). Reading the local clock inside `apply()` would let replicas decide differently.
    - *Resolution*: The leader stamps each booking and cancellation with `requested_at` before replicating it, and every replica evaluates the rule against that value. The same idea keeps the mock payment gateway deterministic: its decision depends only on the command, and its ledger is part of the snapshot and the replica digest.
 
+11. **Restarting a Crashed Node for the Demo**:
+   - *Challenge*: Killing the leader is only half of a failover demo; the audience also needs to see the node come back with its data, and `--fresh` would wipe the very log that proves recovery.
+   - *Resolution*: The failover demo restarts the node in its own terminal window, without `--fresh`, so the audience sees `recovered from disk` followed by catch-up to the leader's commit index. Every node's `STATUS` line prints a hash of the booking data, so identical hashes show the replicas agree.
+
+12. **A Small Model That Must Follow a Conversation**:
+   - *Challenge*: Users do not answer clarification questions with full sentences; they reply "delhi", "dose 1" or "yes", and they misspell city and centre names.
+   - *Resolution*: The assistant treats short replies as answers to its own pending question and fuzzy-matches names against the real slots. A thin guardrail checks each model answer sentence by sentence and replaces one that invents numbers or contact details, inverts the cancellation deadline or gives medical advice.
+
 ---
 
-## 4. Potential Future Enhancements
+## 4. Testing and Results
+
+- **85 automated tests** across unit, in-process three-node cluster and real multi-process cluster levels (Raft unit and safety, membership, stress, contracts, booking rules, authentication, natural-language assistant).
+- **49 live end-to-end checks** from `verify_milestone2.py` against real clusters with the real LLM: failover, quorum loss, full restart, five nodes, snapshots and membership changes.
+- **Failover**: a new leader was elected 0.6 s after the crash in our latest run (0.8–1.2 s earlier), with 0 client errors; the crashed node recovered from disk and caught up to the same commit index and state hash as the others.
+- **Consistency**: 161 bookings and 147 cancellations audited across every slot, with no overbooking and no lost updates.
+
+---
+
+## 5. Limitations and Potential Future Enhancements
+
+**Limitations**
+
+- All nodes run on one machine, so we exercised process crashes and injected partitions but not real network latency.
+- LLM answers take about 7–9 s.
+- Snapshots are sent as one message.
+
+**Future enhancements**
 
 1. **Joint consensus**: we change membership one server at a time; joint consensus (Raft §6) would allow replacing several servers in one step.
 2. **Catch-up rounds for new servers**: let a joining node replicate as a learner until it is nearly up to date before it becomes a voter (thesis §4.2.1).
 3. **Incremental snapshots**: Snapshots (already implemented, with `InstallSnapshot`) are sent as one message; chunking them would support large state.
-4. **Multi-turn assistant**: remember the conversation so a follow-up like "the second one" resolves a clarification question.
+4. **Fuller conversation memory**: the assistant handles short replies to its own question ("delhi", "dose 1"); remembering the whole conversation would let it resolve references like "the second one".
 5. **Mutual TLS (mTLS)**: Enforcing encrypted and authenticated gRPC channels between nodes for zero-trust production deployments.
