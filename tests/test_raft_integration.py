@@ -79,6 +79,27 @@ class InProcessNode:
         self.raft_server.stop(0)
 
 
+def _wait_for_leader(nodes, timeout=10.0, stable_for=0.3):
+    """Return the leader once exactly one node has led, without change, for
+    `stable_for` seconds and is ready to serve reads (its no-op is committed
+    and it holds a read lease). Waiting for a *stable* leader rather than the
+    first one seen keeps tests deterministic on slow or busy machines, where
+    an early leader can lose its term to a re-election a moment later."""
+    deadline = time.time() + timeout
+    candidate, since = None, 0.0
+    while time.time() < deadline:
+        leaders = [n for n in nodes if n.raft_node is not None and n.raft_node.is_leader]
+        if len(leaders) == 1:
+            if leaders[0] is not candidate:
+                candidate, since = leaders[0], time.time()
+            elif time.time() - since >= stable_for and candidate.raft_node.wait_until_ready_for_reads(0.5):
+                return candidate
+        else:
+            candidate = None
+        time.sleep(0.02)
+    raise AssertionError("no single stable leader elected")
+
+
 @pytest.fixture
 def cluster():
     temp_dir = tempfile.mkdtemp()
@@ -94,8 +115,7 @@ def cluster():
     for n in nodes:
         n.start()
 
-    # Wait for leader election
-    time.sleep(1.0)
+    _wait_for_leader(nodes)
 
     yield nodes
 
@@ -112,7 +132,7 @@ def test_cluster_elects_leader(cluster):
 
 def test_booking_replicated_across_all_nodes(cluster):
     """Verify that a booking proposed through the cluster replicates to all nodes."""
-    leader = next(n for n in cluster if n.raft_node.is_leader)
+    leader = _wait_for_leader(cluster)
     client = TicketClient(host="localhost", port=leader.client_port)
 
     # 1. Login
@@ -141,7 +161,7 @@ def test_booking_replicated_across_all_nodes(cluster):
 
 def test_follower_redirects_to_leader(cluster):
     """Verify that a request directed to a follower is automatically redirected to the leader."""
-    leader = next(n for n in cluster if n.raft_node.is_leader)
+    leader = _wait_for_leader(cluster)
     follower = next(n for n in cluster if not n.raft_node.is_leader)
 
     # Directly create a client pointing to the follower's port

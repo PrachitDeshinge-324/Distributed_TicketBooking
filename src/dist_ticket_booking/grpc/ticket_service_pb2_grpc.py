@@ -34,6 +34,11 @@ class TicketClientServiceStub:
         Args:
             channel: A grpc.Channel.
         """
+        self.Register = channel.unary_unary(
+                '/ticketservice.v1.TicketClientService/Register',
+                request_serializer=ticket__service__pb2.RegisterRequest.SerializeToString,
+                response_deserializer=ticket__service__pb2.StatusResponse.FromString,
+                _registered_method=True)
         self.Login = channel.unary_unary(
                 '/ticketservice.v1.TicketClientService/Login',
                 request_serializer=ticket__service__pb2.LoginRequest.SerializeToString,
@@ -58,6 +63,13 @@ class TicketClientServiceStub:
 
 class TicketClientServiceServicer:
     """Missing associated documentation comment in .proto file."""
+
+    def Register(self, request, context):
+        """Explicit sign-up (replicated through Raft). Login fails for unknown users.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def Login(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -86,6 +98,11 @@ class TicketClientServiceServicer:
 
 def add_TicketClientServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'Register': grpc.unary_unary_rpc_method_handler(
+                    servicer.Register,
+                    request_deserializer=ticket__service__pb2.RegisterRequest.FromString,
+                    response_serializer=ticket__service__pb2.StatusResponse.SerializeToString,
+            ),
             'Login': grpc.unary_unary_rpc_method_handler(
                     servicer.Login,
                     request_deserializer=ticket__service__pb2.LoginRequest.FromString,
@@ -116,6 +133,33 @@ def add_TicketClientServiceServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class TicketClientService:
     """Missing associated documentation comment in .proto file."""
+
+    @staticmethod
+    def Register(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ticketservice.v1.TicketClientService/Register',
+            ticket__service__pb2.RegisterRequest.SerializeToString,
+            ticket__service__pb2.StatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def Login(request,

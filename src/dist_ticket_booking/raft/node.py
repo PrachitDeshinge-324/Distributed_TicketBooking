@@ -562,8 +562,17 @@ class RaftNode:
             t.start()
             threads.append(t)
 
+        # One shared deadline for the whole round (not 0.5 s per peer), and
+        # stop waiting as soon as the election is decided either way.
+        deadline = time.monotonic() + 0.5
         for t in threads:
-            t.join(timeout=0.5)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            with self._lock:
+                if self.state != NodeState.CANDIDATE or self.current_term != term:
+                    return  # won (became leader) or stepped down
+            t.join(timeout=remaining)
 
         with self._lock:
             if self.state == NodeState.CANDIDATE and self.current_term == term:
@@ -1255,4 +1264,6 @@ class RaftNode:
                 "state_digest": self.state_machine.digest(),
                 "members": sorted(set(self.config.peers) | ({self.node_id} if self.config.voting else set())),
                 "voting": self.config.voting,
+                # Process id, so local demo tools can crash the current leader.
+                "pid": os.getpid(),
             }

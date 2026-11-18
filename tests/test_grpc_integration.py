@@ -31,7 +31,7 @@ def running_services():
             center_name="Test Health Center",
             center_pincode="000001",
             dose_number=1,
-            date="2026-11-01",
+            date="2027-03-01",
             available_count=2,
             price=0.0,
         ),
@@ -89,13 +89,25 @@ def test_full_client_workflow_via_grpc(running_services):
 
         biz_res = client.process_business_request(
             request_id="REQ-001",
-            payload={"action": "booking", "user_id": "test_user", "ticket_id": "SLOT-CVS-D1-TEST", "quantity": 1},
+            payload={"action": "booking", "user_id": "walk_in_user", "ticket_id": "SLOT-CVS-D1-TEST", "quantity": 1},
         )
         assert biz_res.status == "accepted"
 
         # now slot should be sold out
-        post_rejected = client.post(token, "booking", {"ticket_id": "SLOT-CVS-D1-TEST", "quantity": 1})
+        other = TicketClient(host="localhost", port=port)
+        other_tok = other.login("late_user", "password").token
+        post_rejected = other.post(other_tok, "booking", {"ticket_id": "SLOT-CVS-D1-TEST", "quantity": 1})
         assert post_rejected.status == "rejected"
+        assert "not enough" in post_rejected.message
+        other.close()
+
+        # Malformed payloads are rejected with a clear message, not a crash.
+        bad = client.post(token, "booking", {"quantity": 1})
+        assert bad.status == "invalid" and "ticket_id" in bad.message
+        bad = client.post(token, "booking", {"ticket_id": "SLOT-CVS-D1-TEST", "quantity": "two"})
+        assert bad.status == "invalid" and "quantity" in bad.message
+        bad = client.post(token, "booking", "[1, 2]")
+        assert bad.status == "invalid"
 
         logout_res = client.logout(token)
         assert logout_res.status == "success"
@@ -116,7 +128,7 @@ def test_concurrency_control_prevents_overbooking():
         "center_name": "Rush Test Center",
         "center_pincode": "999999",
         "dose_number": 1,
-        "date": "2026-11-01",
+        "date": "2027-03-01",
         "available_count": 3,
         "price": 0.0,
         "status": "available",

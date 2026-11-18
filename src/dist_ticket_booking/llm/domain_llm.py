@@ -12,6 +12,12 @@ Qwen3.5 linear-attention layers run a slow reference implementation
 (~1-2 s per token), so the app server applies a deadline and falls back
 to keyword answers if the model is too slow.
 
+Domain grounding (no fine-tuning needed): every FAQ prompt carries the
+booking-policy passages retrieved for the question (llm/knowledge.py) and
+the live, Raft-replicated slot data; the answer is then checked against
+them. Identical questions over identical live data are answered from a
+small cache, so repeated FAQs cost no inference at all.
+
 Concurrency design:
   - A single background worker thread owns the pipeline exclusively,
     so concurrent gRPC callers never touch the model simultaneously.
@@ -26,11 +32,15 @@ import queue
 import threading
 import re
 import time
+from collections import OrderedDict
+
+from dist_ticket_booking.llm.knowledge import best_passage, retrieve
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-0.8B"
 _MAX_NEW_TOKENS = 80
 _TOKENS_PER_LIVE_LINE = 30   # extra budget per slot listed in the live context
 _MAX_NEW_TOKENS_CAP = 320
+_ANSWER_CACHE_SIZE = 256     # FAQ answers kept for identical (question, live data)
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +62,8 @@ SYSTEM_CONTEXT = (
     "6. Cancellation deadline: an appointment can be cancelled only up to 24 hours before "
     "its scheduled time. To cancel, use the cancel option with your booking ID; any fee paid is refunded. "
     "7. Government center slots are free. Private center slots may cost Rs. 150 to Rs. 250. "
-    "8. Each citizen can book a maximum of 1 slot per appointment session. "
+    "8. Each citizen can hold at most one active appointment per vaccination session (slot), "
+    "and each booking is for one person. A session cannot be booked once it has started. "
     "9. Booking: log in, check availability, then book a slot by its slot ID. "
     "Do not provide medical or clinical advice. Only answer booking-related questions. "
     "When live system data is provided, use it for questions about availability: "
@@ -107,49 +118,13 @@ def _split_prompt(prompt: str):
     query, _, context = prompt.partition("\n\nContext:")
     return query.strip(), context.strip()
 
-# Keyword fallback — used when the model is not available
-_FAQ_FALLBACK = {
-    "cancel": (
-        "Cancellation is allowed only up to 24 hours before your scheduled appointment. "
-        "To cancel, use the cancel option with your booking ID; any fee paid is refunded."
-    ),
-    "available": (
-        "Slot availability depends on the vaccination center and date. "
-        "Use the 'get availability' option to see current open slots."
-    ),
-    "document": (
-        "You need any valid government-issued photo ID: Aadhaar card, Voter ID, "
-        "Passport, or Driving License."
-    ),
-    "price": (
-        "Government center slots are free of charge. "
-        "Private center slots cost between Rs. 150 and Rs. 250."
-    ),
-    "covishield": (
-        "The minimum gap between COVISHIELD Dose 1 and Dose 2 is 84 days (12 weeks)."
-    ),
-    "covaxin": (
-        "The minimum gap between COVAXIN Dose 1 and Dose 2 is 28 days (4 weeks)."
-    ),
-    "booster": (
-        "The booster (precaution) dose is allowed only once at least 9 months have "
-        "passed since completing Dose 2."
-    ),
-    "age": (
-        "COVISHIELD and COVAXIN are for ages 18+. "
-        "CORBEVAX is for citizens aged 15 to 17 years."
-    ),
-}
-
-
 _LIVE_MARKER = "Current live slot availability:"
 _LIVE_QUERY_WORDS = ("available", "availability", "seat", "slot", "how many", "remaining", "left", "vacant", "open")
 
 
 def _relevant_policy(query: str) -> str:
-    """Policy snippets matching the query; grounds the small model's answer."""
-    q = query.lower()
-    return " ".join(ans for kw, ans in _FAQ_FALLBACK.items() if kw in q and kw != "available")
+    """The best-matching policy passage; the answer is checked against it."""
+    return best_passage(query)
 
 
 def _grounded(answer: str, query: str) -> str:
@@ -211,9 +186,9 @@ def _keyword_fallback(prompt: str) -> str:
     q = query.lower()
     if _LIVE_MARKER in context and any(w in q for w in _LIVE_QUERY_WORDS) and "cancel" not in q:
         return context.strip()
-    for keyword, answer in _FAQ_FALLBACK.items():
-        if keyword in q:
-            return answer
+    policy = best_passage(query)
+    if policy:
+        return policy
     return (
         "For vaccine booking queries please contact the helpdesk or "
         "visit the official vaccination portal."
@@ -249,6 +224,9 @@ class DomainLLM:
         self._pipeline = None  # (tokenizer, model) once loaded
         self.device = "cpu"
         self._request_queue: queue.Queue = queue.Queue()
+        self._cache: "OrderedDict[str, str]" = OrderedDict()
+        self._cache_lock = threading.Lock()
+        self.cache_hits = 0
 
         self._load_model()
         self._start_worker()
@@ -372,9 +350,9 @@ class DomainLLM:
         parts = []
         if context and context != "TicketClientFAQ":
             parts.append(f"Live system data:\n{context}")
-        policy = _relevant_policy(query)
-        if policy:
-            parts.append(f"Relevant policy: {policy}")
+        passages = retrieve(query, k=2)
+        if passages:
+            parts.append("Relevant policy: " + " ".join(p.text for p in passages))
         user = "\n\n".join(parts + [f"Question: {query}"]) if parts else query
         messages = [
             {"role": "system", "content": SYSTEM_CONTEXT},
@@ -429,6 +407,26 @@ class DomainLLM:
         return self._submit(prompt, "faq")
 
     def _submit(self, prompt: str, kind: str) -> dict:
+        # The prompt includes the live slot data, so a cached answer is only
+        # reused while that data is unchanged.
+        key = f"{kind}\x00{prompt}"
+        with self._cache_lock:
+            cached = self._cache.get(key)
+            if cached is not None:
+                self._cache.move_to_end(key)
+                self.cache_hits += 1
+        if cached is not None:
+            return {"model": self.model_name, "prompt": prompt, "response": cached,
+                    "status": "ready", "cached": True}
+        result = self._submit_uncached(prompt, kind)
+        if result["status"] == "ready" and self._pipeline is not None and result["response"]:
+            with self._cache_lock:
+                self._cache[key] = result["response"]
+                while len(self._cache) > _ANSWER_CACHE_SIZE:
+                    self._cache.popitem(last=False)
+        return result
+
+    def _submit_uncached(self, prompt: str, kind: str) -> dict:
         result_holder: dict = {}
         done = threading.Event()
         self._request_queue.put((prompt, done, result_holder, kind))

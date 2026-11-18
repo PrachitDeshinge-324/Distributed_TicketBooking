@@ -3,6 +3,8 @@ syntax = "proto3";
 package ticketservice.v1;
 
 service TicketClientService {
+  // Explicit sign-up (replicated through Raft). Login fails for unknown users.
+  rpc Register(RegisterRequest) returns (StatusResponse);
   rpc Login(LoginRequest) returns (LoginResponse);
   rpc Logout(LogoutRequest) returns (StatusResponse);
   rpc Post(PostRequest) returns (StatusResponse);
@@ -40,6 +42,13 @@ service RaftService {
 
 // --- Messages for Client Functions ---
 
+message RegisterRequest {
+  string username = 1;
+  string password = 2;
+  string role = 3;        // "citizen" (default) or "admin"
+  string admin_code = 4;  // required for role "admin" (cluster sign-up code)
+}
+
 message LoginRequest {
   string username = 1;
   string password = 2;
@@ -50,6 +59,7 @@ message LoginResponse {
   optional string token = 2;
   string leader_hint = 3; // "host:port" or client address for leader redirect
   string message = 4;     // human-readable detail (e.g. "no quorum")
+  string role = 5;        // role of the logged-in account ("citizen" or "admin")
 }
 
 message LogoutRequest {
@@ -196,8 +206,10 @@ message MembershipChangeRequest {
   string host = 3;        // add only: address other nodes and clients use
   int32 raft_port = 4;    // add only
   int32 client_port = 5;  // add only
+  string token = 6;       // session token of an admin account
 }
 
 message TransferLeadershipRequest {
   string target_node = 1; // empty = pick the most up-to-date follower
+  string token = 2;       // session token of an admin account
 }

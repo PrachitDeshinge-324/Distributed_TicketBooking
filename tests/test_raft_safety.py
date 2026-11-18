@@ -55,7 +55,7 @@ def test_partitioned_leader_never_serves_stale_data(cluster):  # noqa: F811
     """Isolate the leader. The majority elects a new leader and keeps
     booking; the old leader must refuse reads and writes instead of
     returning stale seat counts. After healing, all replicas agree."""
-    old = next(n for n in cluster if n.raft_node.is_leader)
+    old = _wait_for_leader(cluster)
     majority = [n for n in cluster if n is not old]
 
     stale_client = TicketClient(host="localhost", port=old.client_port)
@@ -113,7 +113,7 @@ def test_partitioned_leader_never_serves_stale_data(cluster):  # noqa: F811
 def test_minority_follower_cannot_disrupt_cluster(cluster):  # noqa: F811
     """A follower cut off from everyone keeps timing out and raising its
     term, but cannot win an election, and the leader keeps committing."""
-    leader = next(n for n in cluster if n.raft_node.is_leader)
+    leader = _wait_for_leader(cluster)
     loner = next(n for n in cluster if n is not leader)
     others = [n for n in cluster if n is not loner]
     loner.raft_node.set_partition([n.node_id for n in others])
@@ -184,15 +184,50 @@ def test_atomic_write_leaves_no_partial_file(temp_dir):
 def test_corrupt_stable_storage_refuses_to_start(temp_dir):
     """Starting from an empty log after forgetting acknowledged entries
     would break Raft's safety, so a corrupt file is a hard error."""
-    with open(os.path.join(temp_dir, "n1_log.json"), "w") as f:
-        f.write("[{\"term\": 1, \"ind")
+    with open(os.path.join(temp_dir, "n1_log.jsonl"), "w") as f:
+        # A damaged line that is NOT the last one: real corruption, not a torn append.
+        f.write('{"term": 1, "ind\n{"term": 1, "index": 1, "command_type": "noop"}\n')
     with pytest.raises(CorruptStateError):
         RaftLog(temp_dir, "n1")
     with open(os.path.join(temp_dir, "n1_state.json"), "w") as f:
         f.write("{")
-    os.remove(os.path.join(temp_dir, "n1_log.json"))
+    os.remove(os.path.join(temp_dir, "n1_log.jsonl"))
     with pytest.raises(CorruptStateError):
         RaftNode(ClusterConfig(node_id="n1", data_dir=temp_dir), BookingService())
+
+
+def test_torn_last_line_from_a_crashed_append_is_dropped(temp_dir):
+    """A crash in the middle of an append can only tear the final line, which
+    holds an entry that was never acknowledged: drop it and keep the rest."""
+    log = RaftLog(temp_dir, "n1")
+    for i in range(3):
+        log.append(LogEntry(term=1, index=i, command_type="noop"))
+    with open(os.path.join(temp_dir, "n1_log.jsonl"), "a") as f:
+        f.write('{"term": 1, "index": 3, "comm')
+    reloaded = RaftLog(temp_dir, "n1")
+    assert reloaded.last_index() == 2
+    reloaded.append(LogEntry(term=1, index=3, command_type="noop"))
+    assert RaftLog(temp_dir, "n1").last_index() == 3
+
+
+def test_append_writes_only_new_entries(temp_dir):
+    """Appends cost O(new entries): earlier lines are never rewritten."""
+    log = RaftLog(temp_dir, "n1")
+    path = os.path.join(temp_dir, "n1_log.jsonl")
+    log.append(LogEntry(term=1, index=0, command_type="noop"))
+    with open(path) as f:
+        first = f.read()
+    log.extend([LogEntry(term=1, index=i, command_type="noop") for i in (1, 2)])
+    with open(path) as f:
+        after = f.read()
+    assert after.startswith(first) and after.count("\n") == 3
+
+
+def test_legacy_json_log_is_migrated(temp_dir):
+    atomic_write_json(os.path.join(temp_dir, "n1_log.json"),
+                      [{"term": 1, "index": 0, "command_type": "noop", "command": {}}])
+    assert RaftLog(temp_dir, "n1").last_index() == 0
+    assert not os.path.exists(os.path.join(temp_dir, "n1_log.json"))
 
 
 def test_crash_between_snapshot_and_log_rewrite(temp_dir):
@@ -212,7 +247,7 @@ def test_crash_between_snapshot_and_log_rewrite(temp_dir):
 # ── Authentication ─────────────────────────────────────────────────────────
 
 def test_login_checks_password_on_every_replica(cluster):  # noqa: F811
-    leader = next(n for n in cluster if n.raft_node.is_leader)
+    leader = _wait_for_leader(cluster)
     c = TicketClient(host="localhost", port=leader.client_port)
     assert c.login("sam", "s3cret-pass").status == "success"
     assert c.login("sam", "wrong").status == "unauthorized"
@@ -223,7 +258,7 @@ def test_login_checks_password_on_every_replica(cluster):  # noqa: F811
     _wait_converged_digest(cluster)
     for n in cluster:
         assert "sam" in n.raft_node.state_machine.users
-        with open(os.path.join(n.data_dir, n.node_id, f"{n.node_id}_log.json")) as f:
+        with open(os.path.join(n.data_dir, n.node_id, f"{n.node_id}_log.jsonl")) as f:
             assert "s3cret-pass" not in f.read(), "plain-text password reached the Raft log"
 
 

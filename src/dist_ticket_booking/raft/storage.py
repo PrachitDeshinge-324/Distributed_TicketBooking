@@ -20,14 +20,19 @@ class CorruptStateError(RuntimeError):
     """
 
 
-def atomic_write_json(path: str, data: Any) -> None:
-    """Write `data` as JSON to `path` atomically and durably."""
+def atomic_write_text(path: str, text: str) -> None:
+    """Replace the contents of `path` with `text` atomically and durably."""
     tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(data, f)
+    with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, path)  # atomic on POSIX and Windows
+
+
+def atomic_write_json(path: str, data: Any) -> None:
+    """Write `data` as JSON to `path` atomically and durably."""
+    atomic_write_text(path, json.dumps(data))
 
 
 def read_json(path: str) -> Any:

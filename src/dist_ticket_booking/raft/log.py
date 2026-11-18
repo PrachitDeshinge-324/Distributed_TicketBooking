@@ -1,4 +1,11 @@
-"""Raft log with JSON persistence and log compaction (snapshotting)."""
+"""Raft log with append-only durable persistence and log compaction (snapshotting).
+
+On disk the log is a JSON-lines file, one entry per line. Appending writes
+only the new lines and fsyncs them, so the cost of an append does not grow
+with the length of the log. The rare operations that remove entries
+(conflict truncation, compaction, installing a snapshot) rewrite the file
+atomically.
+"""
 import json
 import logging
 import os
@@ -6,7 +13,9 @@ import threading
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Any
 
-from dist_ticket_booking.raft.storage import CorruptStateError, atomic_write_json, read_json
+from dist_ticket_booking.raft.storage import (
+    CorruptStateError, atomic_write_json, atomic_write_text, read_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,21 +62,25 @@ class LogEntry:
 
 
 class RaftLog:
-    """Manages the ordered Raft log with JSON persistence and log compaction.
+    """Manages the ordered Raft log with durable persistence and log compaction.
 
     Entries are indexed by their global logical index and are always
     contiguous, so lookups are O(1) offsets from the first retained entry.
     Log compaction discards entries up to `last_included_index`
     after they are committed and saved to stable snapshot storage.
 
-    Every mutation is written to disk atomically (see `storage.py`) before
-    the method returns, so an acknowledged entry survives a crash.
+    Every mutation reaches stable storage (fsync) before the method returns,
+    so an acknowledged entry survives a crash. Appends cost O(new entries).
+    A crash in the middle of an append can only leave a torn *last* line;
+    that entry was never acknowledged, so it is dropped on load.
     """
 
     def __init__(self, data_dir: str, node_id: str):
         self._entries: List[LogEntry] = []
         self._lock = threading.Lock()
-        self._persist_path = os.path.join(data_dir, f"{node_id}_log.json")
+        self._persist_path = os.path.join(data_dir, f"{node_id}_log.jsonl")
+        # Whole-file JSON format used before the append-only log; migrated on load.
+        self._legacy_path = os.path.join(data_dir, f"{node_id}_log.json")
         self._snapshot_path = os.path.join(data_dir, f"{node_id}_snapshot.json")
         self.last_included_index: int = -1
         self.last_included_term: int = 0
@@ -78,7 +91,7 @@ class RaftLog:
         """Append a log entry. Returns the entry's index."""
         with self._lock:
             self._entries.append(entry)
-            self._persist()
+            self._append_to_disk([entry])
             return entry.index
 
     def extend(self, entries: List[LogEntry]) -> None:
@@ -87,7 +100,7 @@ class RaftLog:
             return
         with self._lock:
             self._entries.extend(entries)
-            self._persist()
+            self._append_to_disk(entries)
 
     def _find(self, index: int) -> Optional[LogEntry]:
         """Entry at a global index, or None. Caller holds self._lock."""
@@ -225,13 +238,52 @@ class RaftLog:
         with self._lock:
             return len(self._entries)
 
-    def _persist(self):
-        """Write the log to disk atomically. Caller holds self._lock."""
+    @staticmethod
+    def _encode(entries: List[LogEntry]) -> str:
+        return "".join(json.dumps(e.to_dict(), separators=(",", ":")) + "\n" for e in entries)
+
+    def _append_to_disk(self, entries: List[LogEntry]):
+        """Durably append entries to the log file. Caller holds self._lock."""
         try:
-            atomic_write_json(self._persist_path, [e.to_dict() for e in self._entries])
+            with open(self._persist_path, "a", encoding="utf-8", newline="\n") as f:
+                f.write(self._encode(entries))
+                f.flush()
+                os.fsync(f.fileno())
         except OSError as e:
             logger.error(f"Failed to persist log: {e}")
             raise
+
+    def _persist(self):
+        """Rewrite the whole log atomically (used after entries were removed).
+        Caller holds self._lock."""
+        try:
+            atomic_write_text(self._persist_path, self._encode(self._entries))
+        except OSError as e:
+            logger.error(f"Failed to persist log: {e}")
+            raise
+
+    def _read_entries(self) -> List[LogEntry]:
+        """Parse the log file. A torn final line (crash during an append) is
+        dropped; damage anywhere else raises CorruptStateError."""
+        try:
+            with open(self._persist_path, "r", encoding="utf-8", newline="") as f:
+                text = f.read()
+        except OSError as exc:
+            raise CorruptStateError(f"stable storage file {self._persist_path} is unreadable: {exc}") from exc
+        lines = text.split("\n")
+        complete, tail = lines[:-1], lines[-1]  # tail == "" when the file ends with a newline
+        entries = []
+        for n, line in enumerate(complete, 1):
+            try:
+                entries.append(LogEntry.from_dict(json.loads(line)))
+            except (ValueError, KeyError, TypeError) as exc:
+                raise CorruptStateError(
+                    f"stable storage file {self._persist_path} is corrupt at line {n}: {exc}") from exc
+        if tail.strip():
+            logger.warning(f"Dropping a torn last line in {self._persist_path} "
+                           f"(crash during an append; that entry was never acknowledged)")
+            atomic_write_text(self._persist_path, self._encode(entries))
+        return entries
 
     def _load(self):
         """Load snapshot and log from disk on startup.
@@ -240,9 +292,13 @@ class RaftLog:
         node must never restart with an empty log it once acknowledged.
         """
         self.load_snapshot()
+        if not os.path.exists(self._persist_path) and os.path.exists(self._legacy_path):
+            entries = [LogEntry.from_dict(d) for d in read_json(self._legacy_path)]
+            atomic_write_text(self._persist_path, self._encode(entries))
+            os.remove(self._legacy_path)
         if not os.path.exists(self._persist_path):
             return
-        entries = [LogEntry.from_dict(d) for d in read_json(self._persist_path)]
+        entries = self._read_entries()
         # A crash between writing a snapshot and rewriting the log leaves
         # entries the snapshot already covers; they are safe to drop.
         self._entries = [e for e in entries if e.index > self.last_included_index]

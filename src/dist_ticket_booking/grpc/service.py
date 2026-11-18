@@ -13,7 +13,11 @@ import grpc
 from . import ticket_service_pb2
 from . import ticket_service_pb2_grpc
 from dist_ticket_booking.business.booking_service import BookingService
-from dist_ticket_booking.core.auth import check_credential, credential_digest
+from dist_ticket_booking.business.payment import DEFAULT_METHOD, SUPPORTED_METHODS, DECLINED_TEST_METHOD
+from dist_ticket_booking.core.auth import (
+    DEFAULT_ADMIN_CODE, ROLE_ADMIN, ROLE_CITIZEN, ROLES, admin_signup_code, credential_digest,
+    register_user, role_of, validate_username, verify_credential,
+)
 from dist_ticket_booking.llm.domain_llm import DomainLLM, _keyword_fallback
 from dist_ticket_booking.llm.intent import (
     intent_context, known_cities, merge, parse_llm_json, resolve, rule_based_intent,
@@ -46,6 +50,71 @@ def _raft_status(res: dict):
     return status, res.get("message", "")
 
 
+class PayloadError(ValueError):
+    """A Post/ProcessBusinessRequest payload does not match its type's schema."""
+
+
+def _parse_payload(raw: str) -> dict:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise PayloadError(f"data is not valid JSON: {e.msg}")
+    if not isinstance(data, dict):
+        raise PayloadError("data must be a JSON object")
+    return data
+
+
+def _field(data: dict, name: str, kind, required: bool = True, default=None):
+    """Typed field access for JSON payloads, with a clear error on mismatch."""
+    if name not in data or data[name] is None:
+        if required:
+            raise PayloadError(f"missing required field {name!r}")
+        return default
+    value = data[name]
+    if kind is int:
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            raise PayloadError(f"field {name!r} must be an integer")
+        try:
+            return int(value)
+        except ValueError:
+            raise PayloadError(f"field {name!r} must be an integer")
+    if not isinstance(value, kind) or (kind is str and not value.strip()):
+        raise PayloadError(f"field {name!r} must be a non-empty {kind.__name__}")
+    return value
+
+
+# Schema per Post type (documented in the README):
+#   booking    {"ticket_id": str, "quantity": int = 1, "priority": int = 0, "payment_method": str = "upi"}
+#   cancel     {"booking_id": str}
+#   assistant  {"text": str}
+def _booking_command(user_id: str, data: dict, request_id: str) -> dict:
+    method = _field(data, "payment_method", str, required=False, default=DEFAULT_METHOD).lower()
+    if method not in SUPPORTED_METHODS + (DECLINED_TEST_METHOD,):
+        raise PayloadError(f"payment_method must be one of {', '.join(SUPPORTED_METHODS)}")
+    return {
+        "user_id": user_id,
+        "ticket_id": _field(data, "ticket_id", str),
+        "quantity": _field(data, "quantity", int, required=False, default=1),
+        "priority": _field(data, "priority", int, required=False, default=0),
+        "payment_method": method,
+        "request_id": request_id,
+        # Stamped once, here on the leader, and replicated with the command:
+        # every replica evaluates the time rules against the same instant.
+        "requested_at": time.time(),
+    }
+
+
+def _cancel_command(user_id: str, data: dict, request_id: str) -> dict:
+    return {
+        "user_id": user_id,
+        "booking_id": _field(data, "booking_id", str),
+        "request_id": request_id,
+        "requested_at": time.time(),
+    }
+
+
 def _fallback_answer(query: str, context: str = "") -> str:
     prompt = f"{query}\n\nContext: {context}" if context else query
     return _keyword_fallback(prompt)
@@ -71,13 +140,51 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
             self.sessions = sessions if sessions is not None else {}
         self.llm_stub = llm_stub
         self.llm_service = llm_service
-        self._users: Dict[str, str] = {}  # standalone (non-Raft) mode only
+        self._users: Dict[str, dict] = {}  # standalone (non-Raft) mode only
         self._tl = threading.local()  # per-request info for log lines (answer source)
 
     def _verify_token(self, token: str) -> Optional[str]:
         if self.raft_node is not None:
             return self.raft_node.state_machine.get_session_user(token)
         return self.sessions.get(token)
+
+    def _role(self, username: str) -> Optional[str]:
+        users = self.raft_node.state_machine.users if self.raft_node is not None else self._users
+        return role_of(users, username)
+
+    @staticmethod
+    def _redirect(res: dict, raft_node):
+        return ticket_service_pb2.StatusResponse(
+            status="redirect", message="not_leader",
+            leader_hint=res.get("leader_hint", "") or (raft_node.get_leader_address() or ""),
+        )
+
+    def _write(self, command_type: str, command: dict, standalone):
+        """Replicate a write through Raft (or run `standalone()` without Raft)
+        and turn the result into a StatusResponse."""
+        if self.raft_node is None:
+            res = standalone()
+            return ticket_service_pb2.StatusResponse(status=res["status"], message=res.get("message", ""))
+        res = self.raft_node.propose(command_type, command)
+        if res.get("message") == "not_leader":
+            return self._redirect(res, self.raft_node)
+        status, message = _raft_status(res)
+        return ticket_service_pb2.StatusResponse(status=status, message=message)
+
+    def Register(self, request, context):
+        problem = validate_username(request.username)
+        if problem or not request.password:
+            return ticket_service_pb2.StatusResponse(status="error", message=problem or "password required")
+        role = request.role or ROLE_CITIZEN
+        if role not in ROLES:
+            return ticket_service_pb2.StatusResponse(status="error", message=f"role must be one of {', '.join(ROLES)}")
+        if role == ROLE_ADMIN and request.admin_code != admin_signup_code():
+            return ticket_service_pb2.StatusResponse(status="unauthorized", message="invalid admin sign-up code")
+        credential = credential_digest(request.username, request.password)
+        return self._write(
+            "register", {"username": request.username, "credential": credential, "role": role},
+            lambda: register_user(self._users, request.username, credential, role),
+        )
 
     def Login(self, request, context):
         if not (request.username and request.password):
@@ -97,15 +204,20 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
                     leader_hint=res.get("leader_hint", "") or (self.raft_node.get_leader_address() or ""),
                 )
             if res.get("status") == "success":
-                return ticket_service_pb2.LoginResponse(status="success", token=res.get("token", token))
+                return ticket_service_pb2.LoginResponse(
+                    status="success", token=res.get("token", token), role=res.get("role", ROLE_CITIZEN))
             status, message = _raft_status(res)
             return ticket_service_pb2.LoginResponse(status=status, message=message)
 
-        if not check_credential(self._users, request.username, credential):
+        ok = verify_credential(self._users, request.username, credential)
+        if ok is None:
+            return ticket_service_pb2.LoginResponse(
+                status="unknown_user", message=f"no account named {request.username!r}; register first")
+        if not ok:
             return ticket_service_pb2.LoginResponse(status="unauthorized", message="invalid username or password")
         token = str(uuid.uuid4())
         self.sessions[token] = request.username
-        return ticket_service_pb2.LoginResponse(status="success", token=token)
+        return ticket_service_pb2.LoginResponse(status="success", token=token, role=self._role(request.username))
 
     def Logout(self, request, context):
         if self.raft_node is not None:
@@ -130,62 +242,26 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
             return ticket_service_pb2.StatusResponse(status="unauthorized", message="Invalid token")
 
         try:
-            data = json.loads(request.data) if request.data else {}
+            data = _parse_payload(request.data)
             if request.type == "booking":
-                ticket_id = data.get("ticket_id")
-                quantity = int(data.get("quantity", 1))
-                priority = int(data.get("priority", 0))
+                cmd = _booking_command(user_id, data, request.request_id)
+                return self._write("create_booking", cmd, lambda: self.booking_service.create_booking(
+                    user_id, cmd["ticket_id"], cmd["quantity"], cmd["priority"],
+                    now=cmd["requested_at"], payment_method=cmd["payment_method"]))
 
-                if self.raft_node is not None:
-                    res = self.raft_node.propose(
-                        "create_booking",
-                        {
-                            "user_id": user_id,
-                            "ticket_id": ticket_id,
-                            "quantity": quantity,
-                            "priority": priority,
-                            "request_id": request.request_id,
-                        },
-                    )
-                    if res.get("message") == "not_leader":
-                        return ticket_service_pb2.StatusResponse(
-                            status="redirect",
-                            message="not_leader",
-                            leader_hint=res.get("leader_hint", "") or (self.raft_node.get_leader_address() or ""),
-                        )
-                    status, message = _raft_status(res)
-                    return ticket_service_pb2.StatusResponse(status=status, message=message)
+            if request.type == "cancel":
+                cmd = _cancel_command(user_id, data, request.request_id)
+                return self._write("cancel_booking", cmd, lambda: self.booking_service.cancel_booking(
+                    user_id, cmd["booking_id"], now=cmd["requested_at"],
+                    is_admin=self._role(user_id) == ROLE_ADMIN))
 
-                res = self.booking_service.create_booking(user_id, ticket_id, quantity, priority)
-                return ticket_service_pb2.StatusResponse(status=res["status"], message=res.get("message", ""))
+            if request.type == "assistant":
+                return self._assistant(user_id, _field(data, "text", str), request.request_id)
 
-            elif request.type == "cancel":
-                booking_id = data.get("booking_id")
-                if self.raft_node is not None:
-                    res = self.raft_node.propose(
-                        "cancel_booking",
-                        {
-                            "user_id": user_id,
-                            "booking_id": booking_id,
-                            "request_id": request.request_id,
-                        },
-                    )
-                    if res.get("message") == "not_leader":
-                        return ticket_service_pb2.StatusResponse(
-                            status="redirect",
-                            message="not_leader",
-                            leader_hint=res.get("leader_hint", "") or (self.raft_node.get_leader_address() or ""),
-                        )
-                    status, message = _raft_status(res)
-                    return ticket_service_pb2.StatusResponse(status=status, message=message)
-
-                res = self.booking_service.cancel_booking(user_id, booking_id)
-                return ticket_service_pb2.StatusResponse(status=res["status"], message=res.get("message", ""))
-
-            elif request.type == "assistant":
-                return self._assistant(user_id, str(data.get("text", "")), request.request_id)
-
-            return ticket_service_pb2.StatusResponse(status="error", message=f"Unknown type: {request.type}")
+            return ticket_service_pb2.StatusResponse(
+                status="error", message=f"Unknown type {request.type!r} (use booking, cancel or assistant)")
+        except PayloadError as e:
+            return ticket_service_pb2.StatusResponse(status="invalid", message=str(e))
         except Exception as e:
             logger.error(f"Post error: {e}")
             return ticket_service_pb2.StatusResponse(status="error", message=str(e))
@@ -245,6 +321,14 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
                 ]
                 return ticket_service_pb2.GetResponse(status="success", items=mine)
 
+            elif request.type == "all_bookings":
+                # Help-desk view: administrators only.
+                if self._role(user_id) != ROLE_ADMIN:
+                    return ticket_service_pb2.GetResponse(status="forbidden")
+                items = [ticket_service_pb2.DataItem(id=bid, data=json.dumps(b))
+                         for bid, b in sorted(self.booking_service.bookings.items())]
+                return ticket_service_pb2.GetResponse(status="success", items=items)
+
             elif request.type == "faq":
                 params = json.loads(request.params) if request.params else {}
                 query = params.get("query", request.params or "")
@@ -265,12 +349,15 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
 
     def _execute(self, command_type: str, command: dict) -> dict:
         """Run a write through Raft (or directly when running standalone)."""
+        command["requested_at"] = time.time()  # leader's clock, replicated with the command
         if self.raft_node is not None:
             return self.raft_node.propose(command_type, command)
         if command_type == "create_booking":
             return self.booking_service.create_booking(
-                command["user_id"], command["ticket_id"], command.get("quantity", 1), command.get("priority", 0))
-        return self.booking_service.cancel_booking(command["user_id"], command["booking_id"])
+                command["user_id"], command["ticket_id"], command.get("quantity", 1), command.get("priority", 0),
+                now=command["requested_at"])
+        return self.booking_service.cancel_booking(command["user_id"], command["booking_id"],
+                                                   now=command["requested_at"])
 
     def _extract_intent_llm(self, text: str, allowed: str, cities) -> dict:
         """Ask the LLM server for a JSON intent; {} if it is unavailable or busy."""
@@ -458,61 +545,35 @@ class TicketAppServicer(ticket_service_pb2_grpc.TicketAppServiceServicer):
         self.llm_stub = llm_stub
         self.llm_service = llm_service
 
+    def _write(self, command_type: str, command: dict, standalone):
+        if self.raft_node is None:
+            res = standalone()
+            return ticket_service_pb2.StatusResponse(status=res["status"], message=res.get("message", ""))
+        res = self.raft_node.propose(command_type, command)
+        if res.get("message") == "not_leader":
+            return TicketClientServicer._redirect(res, self.raft_node)
+        status, message = _raft_status(res)
+        return ticket_service_pb2.StatusResponse(status=status, message=message)
+
     def ProcessBusinessRequest(self, request, context):
+        """Internal application-server API (called by trusted services, so
+        the acting user is named in the payload rather than by a token)."""
         try:
-            payload = json.loads(request.payload) if request.payload else {}
+            payload = _parse_payload(request.payload)
             action = payload.get("action", "booking")
 
             if action == "booking":
-                user_id = payload.get("user_id", "user-system")
-                ticket_id = payload.get("ticket_id")
-                quantity = int(payload.get("quantity", 1))
-                priority = int(payload.get("priority", 0))
-
-                if self.raft_node is not None:
-                    res = self.raft_node.propose(
-                        "create_booking",
-                        {
-                            "user_id": user_id,
-                            "ticket_id": ticket_id,
-                            "quantity": quantity,
-                            "priority": priority,
-                            "request_id": request.request_id,
-                        },
-                    )
-                    if res.get("message") == "not_leader":
-                        return ticket_service_pb2.StatusResponse(
-                            status="redirect",
-                            message="not_leader",
-                            leader_hint=res.get("leader_hint", "") or (self.raft_node.get_leader_address() or ""),
-                        )
-                    status, message = _raft_status(res)
-                    return ticket_service_pb2.StatusResponse(status=status, message=message)
-
-                res = self.booking_service.create_booking(user_id, ticket_id, quantity, priority)
-                return ticket_service_pb2.StatusResponse(status=res["status"], message=res.get("message", ""))
+                user_id = _field(payload, "user_id", str)
+                cmd = _booking_command(user_id, payload, request.request_id)
+                return self._write("create_booking", cmd, lambda: self.booking_service.create_booking(
+                    user_id, cmd["ticket_id"], cmd["quantity"], cmd["priority"],
+                    now=cmd["requested_at"], payment_method=cmd["payment_method"]))
 
             elif action == "cancel":
-                if self.raft_node is not None:
-                    res = self.raft_node.propose(
-                        "cancel_booking",
-                        {
-                            "user_id": payload.get("user_id"),
-                            "booking_id": payload.get("booking_id"),
-                            "request_id": request.request_id,
-                        },
-                    )
-                    if res.get("message") == "not_leader":
-                        return ticket_service_pb2.StatusResponse(
-                            status="redirect",
-                            message="not_leader",
-                            leader_hint=res.get("leader_hint", "") or (self.raft_node.get_leader_address() or ""),
-                        )
-                    status, message = _raft_status(res)
-                    return ticket_service_pb2.StatusResponse(status=status, message=message)
-
-                res = self.booking_service.cancel_booking(payload.get("user_id"), payload.get("booking_id"))
-                return ticket_service_pb2.StatusResponse(status=res["status"], message=res.get("message", ""))
+                user_id = _field(payload, "user_id", str)
+                cmd = _cancel_command(user_id, payload, request.request_id)
+                return self._write("cancel_booking", cmd, lambda: self.booking_service.cancel_booking(
+                    user_id, cmd["booking_id"], now=cmd["requested_at"]))
 
             elif action in ("faq", "llm"):
                 query = payload.get("query", "")
@@ -534,7 +595,10 @@ class TicketAppServicer(ticket_service_pb2_grpc.TicketAppServiceServicer):
                     ans = self.llm_service.get_llm_answer(request.request_id, query)["answer"]
                     return ticket_service_pb2.StatusResponse(status="success", message=ans)
 
-            return ticket_service_pb2.StatusResponse(status="processed", message=f"Processed request {request.request_id}")
+            return ticket_service_pb2.StatusResponse(
+                status="error", message=f"Unknown action {action!r} (use booking, cancel or faq)")
+        except PayloadError as e:
+            return ticket_service_pb2.StatusResponse(status="invalid", message=str(e))
         except Exception as e:
             logger.error(f"ProcessBusinessRequest error: {e}")
             return ticket_service_pb2.StatusResponse(status="error", message=str(e))
@@ -552,15 +616,29 @@ class TicketAppServicer(ticket_service_pb2_grpc.TicketAppServiceServicer):
             leader_hint=res.get("leader_hint", ""),
         )
 
+    def _require_admin(self, token: str):
+        """None if `token` belongs to an administrator, else an error reply."""
+        sm = self.raft_node.state_machine
+        user = sm.get_session_user(token)
+        if not user:
+            return ticket_service_pb2.StatusResponse(status="unauthorized", message="admin login required")
+        if sm.get_role(user) != ROLE_ADMIN:
+            return ticket_service_pb2.StatusResponse(status="forbidden", message=f"{user!r} is not an administrator")
+        return None
+
     def ChangeMembership(self, request, context):
         if self.raft_node is None:
             return ticket_service_pb2.StatusResponse(status="error", message="not running Raft")
+        if (denied := self._require_admin(request.token)) is not None:
+            return denied
         return self._admin_reply(self.raft_node.change_membership(
             request.action, request.node_id, request.host, request.raft_port, request.client_port))
 
     def TransferLeadership(self, request, context):
         if self.raft_node is None:
             return ticket_service_pb2.StatusResponse(status="error", message="not running Raft")
+        if (denied := self._require_admin(request.token)) is not None:
+            return denied
         return self._admin_reply(self.raft_node.transfer_leadership(request.target_node))
 
     def GetLLMAnswer(self, request, context):
@@ -710,12 +788,35 @@ class TicketClient:
                 return res
             time.sleep(self.RETRY_BACKOFF_S)
 
-    def login(self, username: str, password: str = "password", max_redirects: int = 3):
+    def register(self, username: str, password: str, role: str = ROLE_CITIZEN, admin_code: str = ""):
+        """Create an account (role "citizen", or "admin" with the sign-up code)."""
+        req = ticket_service_pb2.RegisterRequest(username=username, password=password, role=role,
+                                                 admin_code=admin_code)
+        return self._call("Register", req)
+
+    def login(self, username: str, password: str = "password", max_redirects: int = 3,
+              auto_register: bool = True, role: str = ROLE_CITIZEN, admin_code: str = ""):
+        """Log in. The server never creates accounts implicitly; for demo and
+        load-test convenience this client registers the account first when
+        the server answers `unknown_user` (pass auto_register=False to
+        disable). A wrong password for an existing account is never retried."""
         req = ticket_service_pb2.LoginRequest(username=username, password=password)
         res = self._call("Login", req, max_redirects)
+        if res.status == "unknown_user" and auto_register:
+            reg = self.register(username, password, role, admin_code)
+            # "already taken" means another client registered the name in
+            # the meantime: just log in. Any other failure is reported as is.
+            if reg.status != "success" and "already taken" not in reg.message:
+                return ticket_service_pb2.LoginResponse(status=reg.status, message=reg.message)
+            res = self._call("Login", req, max_redirects)
         if res.status == "success" and res.token:
             self.token = res.token
         return res
+
+    def login_admin(self, username: str = "admin", password: str = "admin-password",
+                    admin_code: str = DEFAULT_ADMIN_CODE):
+        """Log in as an administrator, creating the admin account if needed."""
+        return self.login(username, password, role=ROLE_ADMIN, admin_code=admin_code)
 
     def logout(self, token: Optional[str] = None, max_redirects: int = 3):
         tok = token or self.token
@@ -754,14 +855,15 @@ class TicketClient:
 
     def change_membership(self, action: str, node_id: str, host: str = "",
                           raft_port: int = 0, client_port: int = 0):
-        """Add or remove one server (sent to the leader)."""
+        """Add or remove one server (sent to the leader). Requires login_admin()."""
         req = ticket_service_pb2.MembershipChangeRequest(
-            action=action, node_id=node_id, host=host, raft_port=raft_port, client_port=client_port)
+            action=action, node_id=node_id, host=host, raft_port=raft_port, client_port=client_port,
+            token=self.token or "")
         return self._call("ChangeMembership", req, stub="app_stub")
 
     def transfer_leadership(self, target_node: str = ""):
         """Ask the leader to hand leadership to `target_node` (default: best follower)."""
-        req = ticket_service_pb2.TransferLeadershipRequest(target_node=target_node)
+        req = ticket_service_pb2.TransferLeadershipRequest(target_node=target_node, token=self.token or "")
         return self._call("TransferLeadership", req, stub="app_stub")
 
     def process_business_request(self, request_id: str, payload: Any, context: str = "", max_redirects: int = 3):

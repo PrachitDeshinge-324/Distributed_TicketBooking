@@ -2,11 +2,11 @@
 import hashlib
 import json
 import logging
-import uuid
 from collections import OrderedDict
 from typing import Dict, Any, Optional
 
-from dist_ticket_booking.core.auth import check_credential
+from dist_ticket_booking.business.payment import MockPaymentGateway
+from dist_ticket_booking.core.auth import ROLE_ADMIN, register_user, role_of, verify_credential
 from dist_ticket_booking.raft.log import LogEntry
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,7 @@ class StateMachine:
     def __init__(self, booking_service):
         self.booking_service = booking_service
         self.sessions: Dict[str, str] = {}  # token -> username (replicated)
-        self.users: Dict[str, str] = {}     # username -> password digest (replicated)
+        self.users: Dict[str, dict] = {}    # username -> {digest, role} (replicated)
         self.last_applied: int = -1
         self._results: Dict[int, dict] = {}  # log_index -> result cache
         # Client request id -> result. A retried write (same request_id) that was
@@ -59,6 +59,9 @@ class StateMachine:
             return result
 
         try:
+            # Time rules use the leader's timestamp carried in the command
+            # (`requested_at`), never this replica's clock, so every replica
+            # reaches the same decision.
             if entry.command_type == "create_booking":
                 result = self.booking_service.create_booking(
                     user_id=cmd["user_id"],
@@ -68,22 +71,37 @@ class StateMachine:
                     # Deterministic id: every replica must assign the same
                     # booking_id so cancels still work after leader failover.
                     booking_id=f"APPT-{cmd['ticket_id'][:12].rstrip('-')}-{cmd['user_id'][:6]}-{entry.index}",
+                    now=cmd.get("requested_at"),
+                    payment_method=cmd.get("payment_method") or "upi",
                 )
             elif entry.command_type == "cancel_booking":
                 result = self.booking_service.cancel_booking(
                     user_id=cmd["user_id"],
                     booking_id=cmd["booking_id"],
+                    now=cmd.get("requested_at"),
+                    is_admin=role_of(self.users, cmd["user_id"]) == ROLE_ADMIN,
                 )
+            elif entry.command_type == "register":
+                result = register_user(self.users, cmd["username"], cmd["credential"],
+                                       cmd.get("role") or "citizen")
             elif entry.command_type == "login":
                 # The credential check runs here, on committed state, so every
-                # replica accepts or rejects the same login.
+                # replica accepts or rejects the same login. Commands proposed
+                # internally (tests, tools) may omit the credential.
                 credential = cmd.get("credential")
-                if credential and not check_credential(self.users, cmd["username"], credential):
+                token = cmd.get("token")
+                ok = True if credential is None else verify_credential(self.users, cmd["username"], credential)
+                if not token:
+                    result = {"status": "error", "message": "login command without a session token"}
+                elif ok is None:
+                    result = {"status": "unknown_user",
+                              "message": f"no account named {cmd['username']!r}; register first"}
+                elif not ok:
                     result = {"status": "unauthorized", "message": "invalid username or password"}
                 else:
-                    token = cmd.get("token") or str(uuid.uuid4())
                     self.sessions[token] = cmd["username"]
-                    result = {"status": "success", "token": token}
+                    result = {"status": "success", "token": token,
+                              "role": role_of(self.users, cmd["username"]) or "citizen"}
             elif entry.command_type == "logout":
                 token = cmd.get("token", "")
                 if token in self.sessions:
@@ -124,7 +142,8 @@ class StateMachine:
         bs = self.booking_service
         inventory = {sid: _field(slot, "available_count") for sid, slot in bs.ticket_store.items()}
         bookings = {bid: b.get("status") for bid, b in bs.bookings.items()}
-        blob = json.dumps([inventory, bookings], sort_keys=True).encode()
+        payments = {pid: p.get("status") for pid, p in bs.payments.ledger.items()}
+        blob = json.dumps([inventory, bookings, payments], sort_keys=True).encode()
         return hashlib.sha1(blob).hexdigest()[:10]
 
     def cached_result(self, request_id: str) -> Optional[dict]:
@@ -136,6 +155,9 @@ class StateMachine:
     def get_session_user(self, token: str) -> Optional[str]:
         """Look up username for a session token."""
         return self.sessions.get(token)
+
+    def get_role(self, username: str) -> Optional[str]:
+        return role_of(self.users, username)
 
     def get_snapshot_data(self) -> dict:
         """Capture state machine state for Raft log compaction."""
@@ -151,6 +173,7 @@ class StateMachine:
                     "center_pincode": getattr(slot, "center_pincode", ""),
                     "dose_number": getattr(slot, "dose_number", 0),
                     "date": getattr(slot, "date", ""),
+                    "time": getattr(slot, "time", None) or "09:00",
                     "available_count": getattr(slot, "available_count", 0),
                     "price": getattr(slot, "price", 0.0),
                     "status": getattr(slot, "status", "available"),
@@ -158,6 +181,7 @@ class StateMachine:
         return {
             "ticket_store": ticket_store_data,
             "bookings": dict(self.booking_service.bookings),
+            "payments": dict(self.booking_service.payments.ledger),
             "sessions": dict(self.sessions),
             "users": dict(self.users),
             "dedupe": dict(self._dedupe),
@@ -173,6 +197,7 @@ class StateMachine:
             self.booking_service.ticket_store = state["ticket_store"]
         if "bookings" in state:
             self.booking_service.bookings = state["bookings"]
+        self.booking_service.payments = MockPaymentGateway(dict(state.get("payments", {})))
         if "sessions" in state:
             # Update in place: the gRPC servicer holds a reference to this dict.
             self.sessions.clear()

@@ -8,9 +8,81 @@ A gRPC-based, multi-node distributed booking system in Python implementing the *
 
 ---
 
+## For the Evaluator: test in 5 minutes
+
+Two ways to check the project. **A** runs everything by itself; **B** gives one command per feature so you can test each one yourself.
+
+### A. Fully automatic (one command, about 3 minutes)
+
+| Windows | macOS | Linux |
+|---|---|---|
+| `run_demo.bat` | `bash run_demo.sh` (or double-click `run_demo.command`) | `bash run_demo.sh` |
+
+The first run installs everything into `.demo_venv` (≈2–3 GB with the LLM; add `--no-llm` for a small, fast install). Five windows open:
+
+| Window | What you see |
+|---|---|
+| T1 LLM server | each FAQ question and the model's answer |
+| T2, T3, T4 Raft nodes | `★ BECAME LEADER` in one of them; every booking appears as the same `COMMITTED #n` line in all three |
+| T5 client | **1)** every client function in order: login, availability, FAQ (LLM), booking, plain-English booking (LLM), my bookings, cancel with refund, logout. **2)** the **automatic leader-failure test**: 6 users keep booking while the leader process is **crashed** (its window shows the process ended), the survivors elect a new leader in ~1 s, the crashed node restarts **in a new window** from its saved data and catches up, then a checklist is printed |
+
+T5 ends with:
+```
+  [PASS] new leader elected by the survivors  (node-3 in term 2, 1.2s after the crash)
+  [PASS] new term is higher than the crashed leader's  (term 1 -> 2)
+  [PASS] clients kept working through the failover  (510 operations and 109 bookings after the crash, 0 client errors)
+  [PASS] no overbooking and no lost updates (seat audit, every slot)  (155 bookings and 139 cancellations all accounted for)
+  [PASS] crashed node node-1 recovered from disk and caught up as a follower  (commit 417)
+  [PASS] all running replicas hold identical data (same state hash)  (3 nodes, hash a9a32a24b0)
+  ALL 6 CHECKS PASSED: leader node-1 crashed, node-3 took over in 1.2s, no data lost
+```
+Run the failure test again at any time from T5 with `python scripts/failover_demo.py`. No windows available (SSH)? `python scripts/demo_launcher.py --background --once` prints the same output in the current terminal.
+
+### B. Command by command
+
+**Start the system** (one terminal each, from the project folder, with the environment activated: `.demo_venv\Scripts\activate` on Windows, `source .demo_venv/bin/activate` on macOS/Linux):
+
+```bash
+# T1  Node 1: LLM server (optional; without it FAQs use the policy text directly)
+python scripts/run_llm_server.py
+# T2  Node 2
+python scripts/run_node.py --node-id node-1 --client-port 50051 --raft-port 50052 --peers node-2:localhost:50054:50053,node-3:localhost:50056:50055 --fresh
+# T3  Node 3
+python scripts/run_node.py --node-id node-2 --client-port 50053 --raft-port 50054 --peers node-1:localhost:50052:50051,node-3:localhost:50056:50055 --fresh
+# T4  Node 4
+python scripts/run_node.py --node-id node-3 --client-port 50055 --raft-port 50056 --peers node-1:localhost:50052:50051,node-2:localhost:50054:50053 --fresh
+```
+
+**Then in T5 (Node 5, client), one feature per command:**
+
+| # | Command | Expected result |
+|---|---|---|
+| 1 | `python scripts/client.py status` | one `* LEADER`, two `follower`s, same term, commit and state hash |
+| 2 | `python scripts/client.py availability` | six slots with seats and prices |
+| 3 | `python scripts/client.py book SLOT-CVS-D1-110001` | `ACCEPTED`; the `COMMITTED` line appears in T2, T3 **and** T4 (replication) |
+| 4 | `python scripts/client.py book SLOT-CVS-D1-110001` | `REJECTED`: one appointment per citizen per slot |
+| 5 | `python scripts/client.py book SLOT-CBX-BOS-560001 --pay card_declined` | `REJECTED`: payment declined, seat count unchanged |
+| 6 | `python scripts/client.py book SLOT-CBX-BOS-560001 --pay card` | `ACCEPTED`: payment of ₹250 received |
+| 7 | `python scripts/client.py my-bookings` | alice's two appointments with their booking IDs |
+| 8 | `python scripts/client.py cancel <booking id from 7>` | `SUCCESS`, seat released, ₹250 refunded |
+| 9 | `python scripts/client.py faq "How do I cancel a booking?"` | LLM answer (24-hour rule); T1 logs the question |
+| 10 | `python scripts/client.py assist "book a covaxin second dose in Mumbai"` | the LLM extracts the intent, the booking is committed through Raft |
+| 11 | `python scripts/client.py all-bookings` then `... all-bookings --admin` | `FORBIDDEN` for a citizen; full list for the admin |
+| 12 | `python scripts/client.py availability --nodes localhost:50055` | served by the leader even when asked through a follower (redirect) |
+| 13 | `python scripts/cluster_admin.py kill-leader` | crashes the leader; prints the new leader and the election time (~1 s) |
+| 14 | in the killed node's terminal: **↑** then remove `--fresh`, **Enter** | `recovered from disk: …`; it rejoins as a follower |
+| 15 | `python scripts/client.py status` | all three nodes again show the same commit and state hash |
+| 16 | `python scripts/run_clients.py --users 5 --duration 30` (run 13 while it runs) | ends with `AUDIT PASSED: no overbooking, no lost updates` |
+| 17 | `python scripts/failover_demo.py` | the automatic failure test from option A |
+| 18 | `python scripts/cluster_admin.py transfer` | planned leadership handover to another node |
+
+**Automated tests:** `pytest -q` (77 tests, ~1 min) · `python scripts/verify_milestone2.py --skip-llm` (33 live checks incl. 5-node cluster, quorum loss, snapshots, membership change).
+
+---
+
 ## Contents
 
-**[▶ One-command Quick Start (Windows / macOS / Linux)](#quick-start-one-command-on-windows-macos-or-linux)** · **[Manual 5-terminal steps](#run-the-demo-in-5-terminals-step-by-step)** · [Milestones Deliverables](#milestones-deliverables) · [Raft Paper Coverage](#raft-paper-coverage) · [Assignment Requirements Coverage](#assignment-requirements-coverage) · [Architecture](#architecture) · [Demo Topology](#demo-topology-5-nodes) · [Raft Consensus Implementation](#raft-consensus-implementation) · [gRPC Contract](#grpc-contract) · [Quick Start & Setup](#quick-start--setup) · [Running the Demos](#running-the-demos) · [Natural-Language Booking](#natural-language-booking-assistant) · [Cluster Administration](#cluster-administration) · [Multi-Machine Deployment](#multi-machine-deployment) · [Testing](#testing) · [Project Structure](#project-structure)
+**[▶ For the Evaluator: test in 5 minutes](#for-the-evaluator-test-in-5-minutes)** · **[One-command Quick Start (Windows / macOS / Linux)](#quick-start-one-command-on-windows-macos-or-linux)** · **[Manual 5-terminal steps](#run-the-demo-in-5-terminals-step-by-step)** · [Milestones Deliverables](#milestones-deliverables) · [Raft Paper Coverage](#raft-paper-coverage) · [Assignment Requirements Coverage](#assignment-requirements-coverage) · [Architecture](#architecture) · [Demo Topology](#demo-topology-5-nodes) · [Raft Consensus Implementation](#raft-consensus-implementation) · [gRPC Contract](#grpc-contract) · [Quick Start & Setup](#quick-start--setup) · [Running the Demos](#running-the-demos) · [Natural-Language Booking](#natural-language-booking-assistant) · [Cluster Administration](#cluster-administration) · [Multi-Machine Deployment](#multi-machine-deployment) · [Testing](#testing) · [Project Structure](#project-structure)
 
 ---
 
@@ -34,13 +106,13 @@ It then:
 |---|---|
 | **T1 LLM server** | `scripts/run_llm_server.py` |
 | **T2 / T3 / T4 Raft nodes** | `scripts/run_node.py` for `node-1`, `node-2`, `node-3` |
-| **T5 client** | waits for the leader election, then runs `scripts/client_demo.py`; afterwards the window is an interactive shell ready for the commands in Steps 4–6 below |
+| **T5 client** | waits for the leader election, runs `scripts/client_demo.py`, then the automatic leader-failure test `scripts/failover_demo.py`; afterwards the window is an interactive shell ready for the commands in Steps 4–6 below |
 
 The second start is fast (nothing to install). Every window stays open when its process ends and prints the command to start it again.
 
 Options (append to the command): `--no-llm` skips PyTorch and the model and the LLM window (small install, FAQs then use keyword rules) · `--keep` keeps data from a previous run · `--background` opens no windows: everything runs hidden, logs go to `.demo/logs`, and the client walkthrough prints in the current terminal (also used automatically over SSH or without a display) · `python scripts/demo_launcher.py stop` stops a `--background` run.
 
-Tested: macOS (clean install into a fresh venv, windows launch and background mode). The Windows and Linux paths use only standard OS mechanisms (`cmd /k` consoles; `gnome-terminal`, `konsole`, `xfce4-terminal`, `kitty`, `alacritty`, `xterm` and others) and fall back to `--background` if no terminal can be opened.
+Tested: macOS (clean install into a fresh venv, windows launch and background mode) and Windows 11 (background mode with the LLM on CPU: full client walkthrough; leader killed under load with the consistency audit passing). The Linux path uses only standard OS mechanisms (`cmd /k` consoles; `gnome-terminal`, `konsole`, `xfce4-terminal`, `kitty`, `alacritty`, `xterm` and others) and fall back to `--background` if no terminal can be opened.
 
 | Problem | Fix |
 |---|---|
@@ -144,7 +216,7 @@ It calls `login → get(availability) → get(faq) → post(booking) → post(as
 python scripts/run_clients.py --users 5 --duration 60 --think 1 --faq
 ```
 While it runs (about 60 s):
-1. Find the terminal whose `STATUS` says `★ LEADER` and press **Ctrl+C** there (the leader crashes).
+1. Find the terminal whose `STATUS` says `★ LEADER` and press **Ctrl+C** there (the leader crashes), or run `python scripts/cluster_admin.py kill-leader` in another terminal (a hard crash, like a power failure).
 2. Within ~1–2 s one of the other two node terminals prints `Starting election` → `★ BECAME LEADER for term 2`. T5 keeps going: the clients find the new leader by themselves.
 3. In the stopped terminal press **↑ then Enter** to run the **same command again — remove `--fresh`** so the node keeps its data. It prints `recovered from disk: term …, N committed entries replayed`, rejoins as a follower and catches up.
 4. When `run_clients.py` ends it prints per-operation statistics and the consistency audit; it must end with **`AUDIT PASSED: no overbooking, no lost updates`**. The three `STATUS` lines show the same `commit=` and the same `state=` hash.
@@ -192,11 +264,12 @@ Running on **5 separate machines** instead: see [Multi-Machine Deployment](#mult
 | Deliverable | Description / Location | Status |
 |---|---|---|
 | **gRPC Service Architecture** | `proto/ticket_service.proto`: `TicketClientService`, `TicketAppService`, `LLMService`, `RaftService` | ✅ Complete |
-| **Authentication & Replicated Sessions** | Salted PBKDF2 password check run by the replicated state machine (plain-text passwords never enter the Raft log); sessions replicated via Raft; seamless client redirection on leader change | ✅ Complete |
+| **Authentication, Accounts & Roles** | Explicit `Register` (replicated); login fails for unknown users; salted PBKDF2 check run by the replicated state machine (plain-text passwords never enter the Raft log); `citizen` and `admin` roles, admin sign-up guarded by a cluster code; cluster operations and the all-bookings view are admin-only; sessions replicated via Raft with seamless redirection on leader change | ✅ Complete |
+| **Booking Rules & Mock Payments** | One appointment per citizen per slot, no booking of a session that has started, cancellation closes 24 h before the appointment, refund on cancel, declined payments reject the booking; time rules use the leader's replicated timestamp so all replicas decide identically; payment ledger is replicated and snapshotted | ✅ Complete |
 | **Domain-specific AI / LLM Server** | Independent CPU-friendly node (`llm/domain_llm.py`, `scripts/run_llm_server.py`) | ✅ Complete |
 | **Raft Consensus Algorithm** | Complete implementation (`src/dist_ticket_booking/raft/`): Leader Election, Log Replication, Commit advancement | ✅ Complete |
 | **Distributed Data Consistency** | Strong consistency: bookings & cancellations commit only after majority replication | ✅ Complete |
-| **Crash Recovery & Persistence** | `current_term`, `voted_for` and the log are written atomically (temp file + `fsync` + rename) before any reply, so a `SIGKILL` mid-write can never lose an acknowledged entry; corrupt state refuses to start | ✅ Complete |
+| **Crash Recovery & Persistence** | `current_term` and `voted_for` are written atomically (temp file + `fsync` + rename); the log is an append-only JSON-lines file, `fsync`-ed before any reply, so an append costs O(new entries); a torn last line from a crash mid-append is dropped (it was never acknowledged); corruption anywhere else refuses to start | ✅ Complete |
 | **Fault Tolerance & Leader Failure** | Automatic heartbeat failure detection, leader re-election, zero data loss (`scripts/demo_fault_tolerance.py`) | ✅ Complete |
 | **Multi-Node Cluster Orchestration** | `scripts/run_cluster.py --nodes N` (3 or 5 nodes; tolerates ⌊(N−1)/2⌋ failures) | ✅ Complete |
 | **Quorum-Loss Handling** | Leader cut off from the majority rejects writes immediately with a clear `unavailable` error (CheckQuorum) | ✅ Complete |
@@ -205,7 +278,7 @@ Running on **5 separate machines** instead: see [Multi-Machine Deployment](#mult
 | **Cluster Membership Changes** | Add or remove a server at runtime through a Raft configuration entry, one server at a time (Raft §6, thesis §4.1); new nodes join as non-voters, a removed leader steps down (`scripts/cluster_admin.py`) | ✅ Complete |
 | **Leadership Transfer** | Hand leadership to a chosen follower for planned maintenance via `TimeoutNow` (thesis §3.10) | ✅ Complete |
 | **Natural-Language Booking (LLM)** | "book me a second COVAXIN dose in Mumbai" / "cancel my covaxin appointment": the LLM extracts the intent, the app server validates it against live replicated data and commits it through Raft (`scripts/assistant.py`) | ✅ Complete |
-| **End-to-End Verification** | 49 live checks: LLM FAQ and natural-language booking, failover, quorum loss, full restart, 5 nodes, log compaction, membership change, leadership transfer (`scripts/verify_milestone2.py`) | ✅ Complete |
+| **End-to-End Verification** | 50 live checks: LLM FAQ and natural-language booking, failover, quorum loss, full restart, 5 nodes, log compaction, membership change, leadership transfer (`scripts/verify_milestone2.py`) | ✅ Complete |
 | **5-Node Demo Topology** | LLM node + 3 Raft nodes + client node with leader kill under load (`scripts/demo_full_system.py`) | ✅ Complete |
 | **Client Node (Node 5)** | Concurrent user simulator with stats and a consistency audit (`scripts/run_clients.py`) | ✅ Complete |
 
@@ -239,7 +312,7 @@ Section-by-section against *In Search of an Understandable Consensus Algorithm (
 | §5.4.2 Committing earlier-term entries | Commit only entries of the current term by counting | `_try_advance_commit_index` + a no-op on election | `test_raft_unit.py`, `verify` §2 |
 | §5.5 Follower/candidate crashes | Idempotent retries | Heartbeats resend missing entries; state machine is idempotent | `test_raft_stress.py` |
 | §5.6 Timing | broadcastTime ≪ electionTimeout ≪ MTBF | ~1 ms RPCs, 100 ms heartbeats, 600–1200 ms timeouts | failover ≈ 1 s in `demo_full_system.py` |
-| Fig. 2 persistent state | `currentTerm`, `votedFor`, `log[]` on stable storage before replying | Atomic temp-file + `fsync` + rename (`raft/storage.py`) | `test_raft_safety.py` |
+| Fig. 2 persistent state | `currentTerm`, `votedFor`, `log[]` on stable storage before replying | Term/vote: atomic temp-file + `fsync` + rename (`raft/storage.py`); log: append-only JSON lines + `fsync` (`raft/log.py`) | `test_raft_safety.py` |
 | §6 Cluster membership changes | Change the configuration without two leaders in one term | Configuration stored as a log entry, used as soon as appended; **one server at a time** (thesis §4.1, see note); joiners are non-voting; removed leader steps down after commit; membership kept in snapshots | `test_raft_membership.py`, `verify` §5 |
 | §7 Log compaction | Snapshots, `InstallSnapshot` | Snapshot every 200 entries; `InstallSnapshot` carries state + membership | `test_raft_unit.py`, `verify` §4 |
 | §8 Client interaction | Find the leader, linearizable writes (no duplicates), no stale reads | Redirect hints; `request_id` de-duplication; no-op + **leader lease** before reads | `test_raft_unit.py`, `test_raft_safety.py`, `test_nl_assistant.py` |
@@ -255,8 +328,9 @@ Section-by-section against *In Search of an Understandable Consensus Algorithm (
 
 | Requirement (assignment PDF) | Where |
 |---|---|
-| Real-time seat reservation with concurrency control (M1) | Per-slot locks in `booking_service.py`; in the cluster every booking is a single Raft log entry applied in log order |
-| Payment processing, mock (M1) | `_process_payment` in `booking_service.py` (paid CORBEVAX slot: ₹250) |
+| Real-time seat reservation with concurrency control (M1) | Per-slot locks make check-and-decrement atomic in `booking_service.py`; in the cluster every booking is a single Raft log entry applied in log order |
+| Payment processing, mock (M1) | `business/payment.py`: deterministic mock gateway with a replicated ledger, capture on booking (paid CORBEVAX slot: ₹250), full refund on cancel, declined-card failure path |
+| Authentication & sessions (M1) | `Register` / `Login` / `Logout`, roles `citizen` / `admin` (`core/auth.py`) |
 | LLM customer-support chatbot (M1) | `Get(type="faq")` → LLM server (`llm/domain_llm.py`) with live availability as context |
 | Overbooking prevention through distributed consistency (M2) | Writes commit only on a majority; 40-client race test; client-node consistency audit |
 | Booking state replication using Raft (M2) | `raft/` package; `StateMachine` applies committed entries on every node |
@@ -269,7 +343,7 @@ Section-by-section against *In Search of an Understandable Consensus Algorithm (
 | `processBusinessRequest`, `getLLMAnswer` | `TicketAppService.ProcessBusinessRequest`, `LLMService.GetLLMAnswer` |
 | `requestVote` / `requestVoteReply`, `appendEntries` / `appendEntriesReply` | `RaftService.RequestVote` / `AppendEntries` with exactly the listed fields (`from, to, term, lastLogIndex, lastLogTerm, prevIndex, prevTerm, commitIndex, entries, voteGranted, entryAppended, matchIndex`) |
 | Stress testing | `tests/test_raft_stress.py`, `scripts/run_clients.py` |
-| README, reflection document, zip | `README.md`, `REFLECTION_DOCUMENT.md`, `scripts/package_submission.sh` |
+| README, reflection document, zip | `README.md`, `REFLECTION_DOCUMENT.md`, `scripts/package_submission.py` |
 
 ---
 
@@ -393,10 +467,12 @@ sequenceDiagram
 
 ### LLM Integration (Node 1)
 - Model: **Qwen/Qwen3.5-0.8B**, loaded offline from the HuggingFace cache; device auto-selected (CUDA → Apple MPS → CPU), thinking mode disabled. ~2–4 s per answer on MPS.
-- **Context-aware**: the app server injects live, Raft-replicated slot availability (filtered to the vaccine/city asked about) into the prompt, plus the matching policy rule.
+- **Domain-specific without fine-tuning**: a small booking-policy knowledge base (`llm/knowledge.py`: cancellation and refunds, prices and payment methods, documents, dose gaps, age limits, one appointment per slot, how to book). For each question the best-matching passages are retrieved by keyword scoring (microseconds, no extra model) and put in the prompt; the model is told to answer only from them. Every passage states a rule the booking service actually enforces, so the assistant and the system never disagree.
+- **Context-aware**: the app server also injects live, Raft-replicated slot availability (filtered to the vaccine/city asked about).
+- **Efficient**: identical questions over unchanged live data are answered from an in-memory cache (no inference); concurrent questions are batched into one forward pass.
 - **Grounding guardrail**: if the model drops or inverts a key policy number (e.g. the 24-hour cancellation deadline), the verified policy text is returned instead.
 - **Natural-language booking**: see [below](#natural-language-booking-assistant).
-- **Resilience**: app-server → LLM calls have a deadline (`LLM_TIMEOUT_S`, default 30 s); if the LLM node is down or too slow, a keyword-based answer is returned and bookings are unaffected.
+- **Resilience**: app-server → LLM calls have a deadline (`LLM_TIMEOUT_S`, default 30 s); if the LLM node is down or too slow, the retrieved policy passage is returned as the answer and bookings are unaffected.
 
 ---
 
@@ -405,12 +481,20 @@ sequenceDiagram
 All communication occurs via gRPC as defined in `proto/ticket_service.proto`:
 
 ### Client & Application RPCs
-- `Login(LoginRequest) -> LoginResponse`: Authenticates the user (first login registers the username; afterwards the same password is required) and replicates the session token via Raft.
+- `Register(RegisterRequest) -> StatusResponse`: Creates an account (`username, password, role, admin_code`). Role `citizen` by default; `admin` requires the cluster's admin sign-up code (`ADMIN_SIGNUP_CODE`, default `aos-admin`). Replicated through Raft.
+- `Login(LoginRequest) -> LoginResponse`: Checks the password and replicates the session token via Raft; returns `role`. Unknown users get `unknown_user` (accounts are never created implicitly). For demos, `TicketClient.login()` registers the account first when it gets `unknown_user` (`auto_register=False` disables this).
 - `Logout(LogoutRequest) -> StatusResponse`: Terminates session across cluster.
-- `Post(PostRequest) -> StatusResponse`: Submits write operations (`booking`, `cancel`, and `assistant` for a natural-language request).
-- `Get(GetRequest) -> GetResponse`: Queries read operations (`availability`, `my_bookings`, `faq`, `cluster_status`).
-- `ProcessBusinessRequest(BusinessRequest) -> StatusResponse`: Inter-service business dispatch.
-- `ChangeMembership(MembershipChangeRequest) -> StatusResponse`, `TransferLeadership(TransferLeadershipRequest) -> StatusResponse`: cluster administration.
+- `Post(PostRequest) -> StatusResponse`: Submits write operations. The `data` JSON is validated per type, and a malformed payload gets `status="invalid"` with the reason:
+
+  | `type` | `data` fields |
+  |---|---|
+  | `booking` | `ticket_id` (str, required), `quantity` (int, must be 1), `priority` (int), `payment_method` (`upi` default, `card`, `netbanking`; `card_declined` simulates a decline) |
+  | `cancel` | `booking_id` (str, required). Allowed up to 24 h before the appointment; admins may cancel any booking |
+  | `assistant` | `text` (str, required): natural-language request |
+
+- `Get(GetRequest) -> GetResponse`: Queries read operations (`availability`, `my_bookings`, `faq`, `cluster_status`; `all_bookings` for admins).
+- `ProcessBusinessRequest(BusinessRequest) -> StatusResponse`: Internal application-server API (`action` = `booking` / `cancel` / `faq`); same validation and rules as `Post`.
+- `ChangeMembership(MembershipChangeRequest) -> StatusResponse`, `TransferLeadership(TransferLeadershipRequest) -> StatusResponse`: cluster administration; require an admin session `token`.
 
 ### LLM RPCs
 - `GetLLMAnswer(LLMQueryRequest) -> GetLLMAnswerResponse`: FAQ answer (`requestId, query, context` → `requestId, answer`).
@@ -422,9 +506,9 @@ All communication occurs via gRPC as defined in `proto/ticket_service.proto`:
 - `InstallSnapshot(InstallSnapshotRequest) -> InstallSnapshotResponse`: Ships the leader's snapshot (and membership) to a follower behind the compacted log.
 - `TimeoutNow(TimeoutNowRequest) -> TimeoutNowResponse`: Leadership transfer. `RequestVote` also carries `pre_vote` and `leadership_transfer` flags.
 
-To regenerate stubs:
+To regenerate stubs (any OS):
 ```bash
-bash scripts/generate_grpc.sh
+python scripts/generate_grpc.py
 ```
 
 ---
@@ -529,7 +613,7 @@ python scripts/assistant.py --user asha "book me a COVAXIN second dose in Mumbai
 
 ```
 you> I want the corbevax booster in Bengaluru
-assistant [✔ accepted]: Payment of ₹250 successful. Appointment confirmed at Fortis Hospital Bangalore for CORBEVAX Dose 3 on 2026-10-07. Booking ID: APPT-SLOT-CBX-BOS-asha-12.
+assistant [✔ accepted]: Payment of ₹250 received (PAY-APPT-SLOT-CBX-BOS-asha-12). Appointment confirmed at Fortis Hospital Bangalore for CORBEVAX Dose 3 on 2027-01-13 at 09:00. Booking ID: APPT-SLOT-CBX-BOS-asha-12.
 you> cancel my appointment
 assistant [? clarify]: You have several matching appointments: ... Which one should I cancel?
 you> how do I cancel a booking?
@@ -571,6 +655,8 @@ python scripts/cluster_admin.py transfer node-2      # planned leadership handov
 python scripts/cluster_admin.py status               # role, term and membership per node
 ```
 
+Membership changes and leadership transfer are admin-only. `cluster_admin.py` logs in as `--admin-user` (default `admin`, password `--admin-password`) and creates that admin account on first use with the sign-up code (`--admin-code`, default: `ADMIN_SIGNUP_CODE` or `aos-admin`). Set the same `ADMIN_SIGNUP_CODE` on every node for a real deployment.
+
 ---
 
 ## Multi-Machine Deployment
@@ -606,7 +692,7 @@ Open the client and Raft ports (and `50060` on the LLM machine) in the firewall.
 
 ## Testing
 
-Run the automated test suite (60 tests covering contracts, business logic, gRPC, Raft units, 3-node cluster integration, stress, partition safety, membership changes and the natural-language assistant):
+Run the automated test suite (77 tests covering booking rules and payments, accounts and roles, business logic, gRPC, Raft units, 3-node cluster integration, stress, partition safety, persistence, membership changes and the natural-language assistant). Cluster tests wait for a *stable* leader that is ready to serve reads, so they are not timing-sensitive on slow machines:
 
 ```bash
 pytest -v        # pytest config in pyproject.toml sets the paths
@@ -618,21 +704,23 @@ pytest -v        # pytest config in pyproject.toml sets the paths
 | `tests/test_raft_unit.py` | Log persistence, elections, one-vote-per-term, append entries & match index safety, commit-safe restart, snapshots & `InstallSnapshot`, exactly-once dedupe | 14 |
 | `tests/test_raft_integration.py` | 3-node live gRPC cluster, leader election, replicated bookings, follower redirect | 3 |
 | `tests/test_raft_stress.py` | 40-client race (no overbooking), leader crash under load, cancel after failover, no-quorum fail-fast | 4 |
-| `tests/test_raft_safety.py` | Partitioned leader never serves stale data, minority follower cannot disrupt, vote-ignore rule, conflict truncation, atomic/corrupt storage, crash between snapshot and log rewrite, password checks on every replica | 8 |
+| `tests/test_raft_safety.py` | Partitioned leader never serves stale data, minority follower cannot disrupt, vote-ignore rule, conflict truncation, atomic/corrupt storage, torn last log line, append-only writes, legacy log migration, crash between snapshot and log rewrite, password checks on every replica | 12 |
 | `tests/test_raft_membership.py` | Add/remove servers (3 → 4 → 3, removing the leader), membership after restart + snapshot, leadership transfer, Pre-Vote | 4 |
 | `tests/test_nl_assistant.py` | Intent extraction, validation of model output, ignoring invented values, question/cancel safety, ambiguity handling, end-to-end NL booking + cancel through Raft with retry | 6 |
-| `tests/test_contracts.py` | Data model contracts and logical lock manager | 4 |
-| `tests/test_business_and_grpc_contracts.py` | Validation, inventory, dispatcher, LLM fallback/grounding, live-context focus | 15 |
-| `tests/test_grpc_integration.py` | Full client workflow, concurrency race prevention | 2 |
-| **Total** | | **60 / 60 Passed** |
+| `tests/test_contracts.py` | Booking rules (one per slot, started sessions, 24-hour cancellation, owner/admin cancel), payments (capture, refund, decline), IST appointment times | 12 |
+| `tests/test_auth_and_rules.py` | On a live cluster: explicit registration, admin sign-up code, admin-only cluster operations and all-bookings view, replicated payment ledger, time rules decided by the replicated timestamp | 6 |
+| `tests/test_business_and_grpc_contracts.py` | Validation, inventory, LLM fallback/grounding, policy retrieval, answer cache, live-context focus | 14 |
+| `tests/test_grpc_integration.py` | Full client workflow incl. payload validation, concurrency race prevention | 2 |
+| **Total** | | **77 / 77 Passed** |
 
 ---
 
 ## Packaging the Submission
 
 ```bash
-bash scripts/package_submission.sh   # zips every git-tracked file into Distributed_TicketBooking_Submission.zip
+python scripts/package_submission.py   # any OS; zips every git-tracked file into Distributed_TicketBooking_Submission.zip
 ```
+Only git-tracked files are packed, so `.demo_venv` (≈1 GB), `.demo/`, `raft_data/` and caches never end up in the zip.
 
 ---
 
@@ -645,27 +733,29 @@ proto/
 src/dist_ticket_booking/
   raft/
     config.py                         ClusterConfig, PeerInfo and current membership
-    log.py                            RaftLog and LogEntry with JSON persistence and compaction
+    log.py                            RaftLog and LogEntry: append-only JSON-lines persistence and compaction
     storage.py                        Atomic, fsync-ed writes for Raft stable storage
     state_machine.py                  StateMachine applying committed log commands
     node.py                           Core RaftNode engine (elections + Pre-Vote, replication, membership, transfer)
   business/
-    booking_service.py                Vaccine slot inventory, booking logic, per-slot locks
-  coordination/
-    lock_manager.py                   Logical lock ownership tracker
-  scheduler/
-    dispatcher.py                     FIFO booking dispatcher queue
+    booking_service.py                Slot inventory, booking rules, per-slot locks
+    payment.py                        Mock payment gateway with replicated ledger (capture / refund / decline)
   core/
-    models.py                         Dataclasses (VaccineSlot, Appointment, ...)
-    auth.py                           Salted PBKDF2 password digests
+    models.py                         VaccineSlot dataclass
+    auth.py                           Accounts, roles (citizen / admin), salted PBKDF2 password digests
+  monitoring/
+    console.py                        UTF-8 / ANSI colour setup for terminal output on every OS
   grpc/
     raft_service.py                   RaftServiceServicer (RequestVote, AppendEntries, InstallSnapshot, TimeoutNow)
     service.py                        TicketClientServicer, TicketAppServicer, TicketClient
     ticket_service_pb2*.py            Compiled protobuf & gRPC stubs
   llm/
-    domain_llm.py                     Standalone domain Qwen3.5-0.8B model (FAQ + intent extraction) / fallback
+    domain_llm.py                     Standalone domain Qwen3.5-0.8B model (FAQ + intent extraction), answer cache, fallback
+    knowledge.py                      Booking-policy knowledge base and keyword retrieval
     intent.py                         Natural-language intent validation, grounding and resolution
 scripts/
+  client.py                           One client action per command (manual testing)
+  failover_demo.py                    Automatic leader crash + recovery test with PASS/FAIL checklist
   run_node.py                         Single Raft node launcher
   run_cluster.py                      Multi-node cluster manager
   demo_raft.py                        Raft consensus replication walkthrough
@@ -675,12 +765,14 @@ scripts/
   run_clients.py                      Client node: concurrent users, stats, consistency audit
   ask.py                              Ask the FAQ assistant one question (live demo helper)
   assistant.py                        Natural-language booking/cancellation chat
-  cluster_admin.py                    Add/remove servers, transfer leadership, cluster status
+  cluster_admin.py                    Add/remove servers, transfer leadership, cluster status, kill-leader
   run_llm_server.py                   Standalone LLM node (Qwen3.5-0.8B)
   monitor_cluster.py                  Live cluster status dashboard
   client_demo.py                      Step-by-step walkthrough of every client function
   demo_launcher.py                    Cross-platform: install, open the 5 terminals, run each (used by run_demo.*)
   demo_concurrency.py                 10-client concurrent race demo
+  generate_grpc.py                    Regenerate the gRPC stubs (any OS)
+  package_submission.py               Build the submission zip from git-tracked files (any OS)
 tests/
   test_raft_unit.py                   Unit tests for Raft internals
   test_raft_integration.py            Integration tests for multi-node Raft
@@ -688,7 +780,8 @@ tests/
   test_raft_safety.py                 Partition, persistence and authentication safety tests
   test_raft_membership.py             Membership change, leadership transfer, Pre-Vote tests
   test_nl_assistant.py                Natural-language booking assistant tests
-  test_contracts.py                   Model contract tests
+  test_contracts.py                   Booking rule and payment tests
+  test_auth_and_rules.py              Accounts, roles, rules and payments on a live cluster
   test_business_and_grpc_contracts.py Business logic contract tests
   test_grpc_integration.py            gRPC integration tests
 ```

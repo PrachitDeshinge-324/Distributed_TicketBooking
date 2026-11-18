@@ -46,6 +46,7 @@ def test_add_and_remove_servers(cluster):  # noqa: F811
         assert not newbie.raft_node.config.voting  # waits; never campaigns
 
         admin = TicketClient.for_cluster([_addr(n) for n in cluster])
+        assert admin.login_admin().status == "success"
         res = admin.change_membership("add", "node-4", "localhost", newbie.raft_port, newbie.client_port)
         assert res.status == "success", res.message
         everyone = cluster + [newbie]
@@ -81,6 +82,7 @@ def test_membership_survives_restart_and_snapshot(cluster):  # noqa: F811
     leader = _wait_for_leader(cluster)
     victim = next(n for n in cluster if n is not leader)
     admin = TicketClient.for_cluster([_addr(n) for n in cluster])
+    assert admin.login_admin().status == "success"
     assert admin.change_membership("remove", victim.node_id).status == "success"
     admin.close()
     victim.stop()
@@ -108,6 +110,7 @@ def test_leadership_transfer(cluster):  # noqa: F811
     target = next(n for n in cluster if n is not leader)
     term = leader.raft_node.current_term
     admin = TicketClient(host="localhost", port=leader.client_port)
+    assert admin.login_admin().status == "success"
     res = admin.transfer_leadership(target.node_id)
     admin.close()
     assert res.status == "success", res.message

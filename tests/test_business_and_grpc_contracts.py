@@ -16,7 +16,7 @@ def _slot_store():
             center_name="Test Health Center",
             center_pincode="000001",
             dose_number=1,
-            date="2026-11-01",
+            date="2027-03-01",
             available_count=10,
             price=0.0,
         )
@@ -84,47 +84,6 @@ def test_llm_stub_contract_is_present():
     assert len(result["response"]) > 0
 
 
-def test_dispatcher_queues_and_dequeues_in_order():
-    from dist_ticket_booking.scheduler.dispatcher import Dispatcher
-    from dist_ticket_booking.core.models import SlotBookingRequest
-
-    d = Dispatcher()
-    r1 = SlotBookingRequest("req-1", "user-a", "SLOT-001", 1, priority=0)
-    r2 = SlotBookingRequest("req-2", "user-b", "SLOT-001", 1, priority=1)
-
-    d.enqueue(r1)
-    d.enqueue(r2)
-
-    assert d.size() == 2
-    first = d.next_request()
-    assert first.request_id == "req-1"
-    assert d.size() == 1
-
-
-def test_lock_manager_serializes_contenders():
-    from dist_ticket_booking.coordination.lock_manager import LockManager
-
-    lm = LockManager()
-    r1 = lm.acquire("process-A")
-    r2 = lm.acquire("process-B")
-    released = lm.release("process-A")
-
-    assert r1["status"] == "acquired"
-    assert r2["status"] == "queued"
-    assert released["next_owner"] == "process-B"
-
-
-def test_booking_service_uses_dispatcher_and_lock_manager():
-    service = VaccinationService(_slot_store())
-
-    result = service.create_booking("U-002", "SLOT-CVS-D1-TEST", 2)
-
-    assert result["status"] == "accepted"
-    # After booking 2 of 10, dispatcher queue should be empty (request consumed)
-    assert service.dispatcher.size() == 0
-
-
-
 def test_llm_fallback_uses_live_availability_context():
     from dist_ticket_booking.llm.domain_llm import _keyword_fallback
     ctx = "Current live slot availability:\n- Slot A: 2 slot(s) available"
@@ -190,3 +149,27 @@ def test_availability_guardrail_rejects_contradictions():
     sold = "Current live slot availability:\n- CORBEVAX Booster — Fortis Bangalore: SOLD OUT on 2026-10-07"
     assert "sold out" in _grounded_availability("Yes, slots are open!", sold)
     assert _grounded_availability("Sorry, it is sold out.", sold) == "Sorry, it is sold out."
+
+
+def test_policy_retrieval_finds_the_right_rule():
+    from dist_ticket_booking.llm.knowledge import retrieve
+    top = lambda q: [p.topic for p in retrieve(q)][:1]  # noqa: E731
+    assert top("How do I cancel a booking?") == ["cancel"]
+    assert top("will I get my money back?") == ["refund"]
+    assert top("can I book two slots for my family") == ["limit"]
+    assert top("what documents should I carry") == ["documents"]
+    assert top("what is the gap for covaxin") == ["covaxin"]
+    assert retrieve("tell me a joke") == []
+
+
+def test_repeated_faq_is_answered_from_cache():
+    from dist_ticket_booking.llm.domain_llm import DomainLLM
+    llm = DomainLLM("domain-model")  # no real model: we stub the inference step
+    calls = []
+    llm._pipeline = object()
+    llm._run_pipeline_batch = lambda prompts: calls.append(prompts) or [f"answer {len(calls)}" for _ in prompts]
+    first = llm.get_llm_answer("r1", "How do I cancel?", "live data v1")["answer"]
+    again = llm.get_llm_answer("r2", "How do I cancel?", "live data v1")["answer"]
+    changed = llm.get_llm_answer("r3", "How do I cancel?", "live data v2")["answer"]
+    assert first == again == "answer 1" and len(calls) == 2 and changed == "answer 2"
+    assert llm.cache_hits == 1

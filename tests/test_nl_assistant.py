@@ -74,6 +74,7 @@ class _WrongLLM:
 
 def test_wrong_model_cannot_book_something_else():
     svc = TicketClientServicer(llm_service=_WrongLLM())
+    svc.Register(ticket_service_pb2.RegisterRequest(username="zoe", password="pw"), None)
     tok = svc.Login(ticket_service_pb2.LoginRequest(username="zoe", password="pw"), None).token
 
     def say(text):

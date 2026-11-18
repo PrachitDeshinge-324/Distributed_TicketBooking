@@ -360,6 +360,7 @@ def section_membership(data_dir):
 
         target = next(s for s in spec if s is not leader)
         admin = TicketClient.for_cluster(targets)
+        check("admin login (cluster operations are admin-only)", admin.login_admin().status == "success")
         r = admin.transfer_leadership(target["node_id"])
         st = node_status(target["client_port"])
         check("leadership transferred on request", r.status == "success" and st and st["state"] == "leader",

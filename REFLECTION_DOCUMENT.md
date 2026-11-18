@@ -3,7 +3,7 @@
 **Course**: CS G623 Advanced Operating Systems · Semester I 2026–2027  
 **Institution**: BITS Pilani  
 **Project Architecture**: Option A — Distributed Ticket Booking System (Vaccine Appointment Booking)  
-**Team Members**: [Member 1 name & BITS ID], [Member 2 name & BITS ID]  
+**Team Members**: Namish Sudeep Kumar (2026H1030059P), Prachit Suresh Deshinge (2026H1030079P)  
 
 ---
 
@@ -21,7 +21,7 @@ Our project implements an end-to-end distributed ticket booking platform that gu
 
 We are a two-member team. Rather than splitting the work by milestone, we split it by **layer of the system**, and each of us owned that layer from Milestone 1 through Milestone 2. Member 1 owned the *distributed layer* (how nodes talk to each other and agree); Member 2 owned the *application layer* (what the system books, how the replicated state behaves, and the AI features). The boundary between the two layers is the `propose()` / `StateMachine.apply()` interface, which we designed together.
 
-### Member 1: [Name / BITS ID] — Distributed layer: communication, consensus and cluster operations
+### Member 1: Namish Sudeep Kumar (2026H1030059P) — Distributed layer: communication, consensus and cluster operations
 
 | | Milestone 1 | Milestone 2 |
 |---|---|---|
@@ -37,11 +37,11 @@ We are a two-member team. Rather than splitting the work by milestone, we split 
 - Killing a process is the easy failure. A leader that is alive but cut off is harder, because it still believes it leads; serving reads safely needed a lease, not just a role check.
 - Membership changes are where intuition fails: changing more than one server at a time can produce two disjoint majorities, which is why we change one server at a time.
 
-### Member 2: [Name / BITS ID] — Application layer: booking logic, replicated state machine and AI
+### Member 2: Prachit Suresh Deshinge (2026H1030079P) — Application layer: booking logic, replicated state machine and AI
 
 | | Milestone 1 | Milestone 2 |
 |---|---|---|
-| **Booking logic** | Vaccine-slot inventory, booking and cancellation, per-slot locks against race conditions, mock payment, dispatcher and lock-manager | Made booking deterministic so every replica produces identical results (booking IDs derived from the log index) |
+| **Booking logic** | Vaccine-slot inventory, booking and cancellation, per-slot locks against race conditions, mock payment | Made booking deterministic so every replica produces identical results (booking IDs derived from the log index) |
 | **State machine** | — | `StateMachine`: applies committed entries, exactly-once de-duplication by `request_id`, snapshot/restore of the business state, state digest for replica comparison |
 | **Authentication** | Credential checks at login | Salted password hashing with the check run inside the replicated state machine, so every replica agrees and no plain-text password enters the log |
 | **LLM server** | Standalone Qwen3.5-0.8B server with batched inference, domain policy prompt and keyword fallback | Live Raft data as context, grounding guardrails for policy numbers and seat counts, back-pressure and timeouts so a slow model never blocks bookings |
@@ -79,7 +79,7 @@ We are a two-member team. Rather than splitting the work by milestone, we split 
 
 5. **Crash-Safe Stable Storage**:
    - *Challenge*: Our first version rewrote the JSON log in place. A `SIGKILL` in the middle of that write would leave a truncated file, and the node would restart with an empty log, forgetting entries it had already acknowledged — which breaks Raft's safety argument.
-   - *Resolution*: Every write now goes to a temporary file, is `fsync`-ed and atomically renamed over the old one. A node that finds unreadable state refuses to start instead of silently starting empty.
+   - *Resolution*: Term and vote are written to a temporary file, `fsync`-ed and atomically renamed over the old one. The log became an append-only JSON-lines file: each append writes and `fsync`s only the new entries, so its cost no longer grows with the log, and a crash mid-append can only tear the last line, which held an entry that was never acknowledged and is dropped on restart. Damage anywhere else makes the node refuse to start instead of silently starting empty.
 
 6. **Stale Reads During a Network Partition**:
    - *Challenge*: Killing a process is not the hardest failure. A leader that is alive but cut off from the others still believes it is the leader, while the majority elects a new one and keeps booking. Reads served by the old leader would show seats that were already sold.
@@ -96,6 +96,10 @@ We are a two-member team. Rather than splitting the work by milestone, we split 
 9. **Letting an LLM Book Appointments Safely**:
    - *Challenge*: The 0.8B model usually extracts intents correctly, but in testing it invented a vaccine the user never mentioned, and could label "how do I cancel?" as a cancellation.
    - *Resolution*: The model only proposes an intent. The app server keeps only values grounded in the user's words, never executes questions, matches against real slots and the user's own bookings, asks when ambiguous, and commits the result through the same Raft path as every other write.
+
+10. **Time-Based Rules in a Replicated State Machine**:
+   - *Challenge*: Rules such as "cancellation closes 24 hours before the appointment" depend on the current time, but replicas apply a committed entry at different moments (a restarted node replays it much later). Reading the local clock inside `apply()` would let replicas decide differently.
+   - *Resolution*: The leader stamps each booking and cancellation with `requested_at` before replicating it, and every replica evaluates the rule against that value. The same idea keeps the mock payment gateway deterministic: its decision depends only on the command, and its ledger is part of the snapshot and the replica digest.
 
 ---
 

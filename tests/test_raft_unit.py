@@ -92,12 +92,12 @@ def test_state_machine_apply(temp_dir):
         term=1,
         index=1,
         command_type="create_booking",
-        command={"user_id": "alice", "ticket_id": target_slot, "quantity": 2},
+        command={"user_id": "alice", "ticket_id": target_slot, "quantity": 1},
     )
     res_book = sm.apply(book_entry)
     assert res_book["status"] == "accepted"
     new_avail = service.get_availability(target_slot)["available_count"]
-    assert new_avail == initial_avail - 2
+    assert new_avail == initial_avail - 1
 
     # 3. Cancel Booking
     booking_id = res_book["booking_id"]
@@ -269,7 +269,8 @@ def test_node_recovery_from_snapshot(temp_dir):
     # Make 2 bookings
     target_slot = "SLOT-CVS-D1-110001"
     node.propose("login", {"username": "alice", "token": "tok-a"})
-    node.propose("create_booking", {"user_id": "alice", "ticket_id": target_slot, "quantity": 2})
+    node.propose("create_booking", {"user_id": "alice", "ticket_id": target_slot, "quantity": 1})
+    node.propose("create_booking", {"user_id": "bob", "ticket_id": target_slot, "quantity": 1})
 
     # Take snapshot
     assert node.take_snapshot()

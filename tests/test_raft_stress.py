@@ -13,19 +13,9 @@ import time
 import pytest
 
 from dist_ticket_booking.grpc.service import TicketClient
-from test_raft_integration import InProcessNode
+from test_raft_integration import InProcessNode, _wait_for_leader  # noqa: F401  (re-exported)
 
 SLOT = "SLOT-CBX-BOS-560001"  # small capacity slot
-
-
-def _wait_for_leader(nodes, timeout=10.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        leaders = [n for n in nodes if n.raft_node.is_leader]
-        if len(leaders) == 1:
-            return leaders[0]
-        time.sleep(0.05)
-    raise AssertionError("no single leader elected")
 
 
 def _wait_converged(nodes, timeout=10.0):
@@ -84,7 +74,7 @@ def _client_worker(entry_port, name, results, stop_evt=None, rounds=1):
 
 def test_concurrent_clients_never_overbook(cluster):
     """40 clients race for a slot with limited capacity."""
-    leader = next(n for n in cluster if n.raft_node.is_leader)
+    leader = _wait_for_leader(cluster)
     capacity = leader.service.get_availability(SLOT)["available_count"]
     assert capacity > 0
 
@@ -112,7 +102,7 @@ def test_concurrent_clients_never_overbook(cluster):
 
 def test_leader_crash_under_load(cluster):
     """Kill the leader while clients are booking; no overbooking, replicas agree."""
-    leader = next(n for n in cluster if n.raft_node.is_leader)
+    leader = _wait_for_leader(cluster)
     survivors = [n for n in cluster if n is not leader]
     capacity = leader.service.get_availability(SLOT)["available_count"]
 
@@ -153,7 +143,7 @@ def test_leader_crash_under_load(cluster):
 
 def test_cancel_works_after_failover(cluster):
     """A booking made via the old leader can be cancelled via the new leader."""
-    leader = next(n for n in cluster if n.raft_node.is_leader)
+    leader = _wait_for_leader(cluster)
     survivors = [n for n in cluster if n is not leader]
 
     c = TicketClient(host="localhost", port=leader.client_port)
@@ -184,7 +174,7 @@ def test_cancel_works_after_failover(cluster):
 
 def test_no_quorum_fails_fast_with_clear_error(cluster):
     """Leader cut off from the majority rejects writes quickly and clearly."""
-    leader = next(n for n in cluster if n.raft_node.is_leader)
+    leader = _wait_for_leader(cluster)
     c = TicketClient(host="localhost", port=leader.client_port)
     tok = c.login("dave").token
     assert tok

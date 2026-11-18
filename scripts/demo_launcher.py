@@ -15,7 +15,8 @@ What `start` does
      packages are never touched) and installs the requirements into it,
   2. downloads the LLM (Qwen3.5-0.8B, about 1.6 GB) into the Hugging Face cache,
   3. opens five terminals and starts, one per terminal:
-       T1 LLM server | T2, T3, T4 Raft nodes | T5 client walkthrough
+       T1 LLM server | T2, T3, T4 Raft nodes | T5 client walkthrough, then
+       the automatic leader-failure test (scripts/failover_demo.py)
      If no graphical terminal can be opened (SSH session, container, WSL
      without a display) it falls back to --background automatically.
 
@@ -209,7 +210,7 @@ def peers_arg(node_id: str) -> str:
     return ",".join(f"{n}:localhost:{rp}:{cp}" for n, cp, rp in NODES if n != node_id)
 
 
-def build_terminals(py: str, fresh: bool, with_llm: bool):
+def build_terminals(py: str, fresh: bool, with_llm: bool, windows: bool = True):
     """[(title, [argv, ...], restart_hint)]. Commands inside one terminal run one after another."""
     me = str(py)
     terms = []
@@ -223,10 +224,12 @@ def build_terminals(py: str, fresh: bool, with_llm: bool):
         terms.append((f"T{i + 2} Raft node {nid}", [base + (["--fresh"] if fresh else [])],
                       f"{keep}   (same command, without --fresh, restarts this node with its saved data)"))
     client = [[me, "scripts/demo_launcher.py", "wait"] + ([] if with_llm else ["--no-llm"]),
-              [me, "scripts/client_demo.py"]]
+              [me, "scripts/client_demo.py"],
+              # Crashes the leader automatically, restarts it, prints PASS/FAIL checks.
+              [me, "scripts/failover_demo.py", "--restart", "window" if windows else "background"]]
     terms.append(("T5 client (node 5)", client,
-                  "python scripts/client_demo.py | python scripts/run_clients.py --users 5 --duration 60 "
-                  "--think 1 --faq | python scripts/assistant.py"))
+                  "python scripts/failover_demo.py | python scripts/client.py --help | "
+                  "python scripts/assistant.py"))
     return terms
 
 
@@ -351,7 +354,7 @@ def start_background(py, args, with_llm):
     """Run every process hidden, logging to .demo/logs, then run the client walkthrough here."""
     logs = RUN_DIR / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    terms = build_terminals(py, not args.keep, with_llm)
+    terms = build_terminals(py, not args.keep, with_llm, windows=False)
     procs = []
     extra = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if IS_WIN else {"start_new_session": True}
     say("Starting in the background. Logs: " + str(logs))
@@ -374,9 +377,22 @@ def start_background(py, args, with_llm):
     except KeyboardInterrupt:
         pass
     finally:
-        stop_pids([p.pid for p in procs])
+        stop_pids([p.pid for p in procs] + restarted_pids())
         (RUN_DIR / "pids.json").unlink(missing_ok=True)
         say("Stopped.")
+
+
+def restarted_pids():
+    """Nodes restarted in the background by failover_demo.py (and forget them)."""
+    path = RUN_DIR / "restarted.json"
+    if not path.exists():
+        return []
+    try:
+        pids = json.loads(path.read_text())
+    except ValueError:
+        pids = []
+    path.unlink(missing_ok=True)
+    return pids
 
 
 def stop_pids(pids):
@@ -414,7 +430,8 @@ def cmd_start(args):
         say("Falling back to --background mode.\n")
         return start_background(py, args, with_llm)
     say(f"\nOpened {len(terms)} terminals: " + ", ".join(t[0] for t in terms))
-    say("T5 waits for the cluster, then walks through every client function.")
+    say("T5 waits for the cluster, walks through every client function, then crashes the leader "
+        "automatically and prints PASS/FAIL checks (a new window opens for the restarted node).")
     say("Stop the demo by pressing Ctrl+C / closing the windows. Re-running this launcher "
         "starts it again.")
 
@@ -468,10 +485,14 @@ def cmd_wait(args):
 
 def cmd_stop(args):
     pid_file = RUN_DIR / "pids.json"
+    extra = restarted_pids()
+    stop_pids(extra)
     if pid_file.exists():
         stop_pids(json.loads(pid_file.read_text()))
         pid_file.unlink()
         say("Stopped the background demo.")
+    elif extra:
+        say("Stopped the node(s) restarted by the failover test.")
     else:
         say("No background demo recorded. Close the terminal windows, or press Ctrl+C in each.")
 

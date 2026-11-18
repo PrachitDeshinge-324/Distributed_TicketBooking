@@ -87,7 +87,7 @@ def run_demo():
         booking_res = client.post(
             token,
             "booking",
-            {"ticket_id": "SLOT-CVS-D1-110001", "quantity": 2, "priority": 1},
+            {"ticket_id": "SLOT-CVS-D1-110001", "quantity": 1, "priority": 1},
         )
         logger.info(f"Booking response: status={booking_res.status}, message={booking_res.message}")
 
@@ -95,9 +95,9 @@ def run_demo():
         updated_res = client.get(token, "availability", {"ticket_id": "SLOT-CVS-D1-110001"})
         updated_data = json.loads(updated_res.items[0].data)
         logger.info(
-            f"Updated Available Count: {updated_data['available_count']} (decremented by 2)"
+            f"Updated Available Count: {updated_data['available_count']} (decremented by 1)"
         )
-        assert updated_data["available_count"] == initial_data["available_count"] - 2
+        assert updated_data["available_count"] == initial_data["available_count"] - 1
 
         logger.info("\n>>> Step 6: Testing Follower Redirection...")
         # Now purposefully connect to another node port (e.g. 50053 or 50055)

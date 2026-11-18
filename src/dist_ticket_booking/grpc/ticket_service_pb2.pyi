@@ -6,6 +6,18 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
+class RegisterRequest(_message.Message):
+    __slots__ = ("username", "password", "role", "admin_code")
+    USERNAME_FIELD_NUMBER: _ClassVar[int]
+    PASSWORD_FIELD_NUMBER: _ClassVar[int]
+    ROLE_FIELD_NUMBER: _ClassVar[int]
+    ADMIN_CODE_FIELD_NUMBER: _ClassVar[int]
+    username: str
+    password: str
+    role: str
+    admin_code: str
+    def __init__(self, username: _Optional[str] = ..., password: _Optional[str] = ..., role: _Optional[str] = ..., admin_code: _Optional[str] = ...) -> None: ...
+
 class LoginRequest(_message.Message):
     __slots__ = ("username", "password")
     USERNAME_FIELD_NUMBER: _ClassVar[int]
@@ -15,16 +27,18 @@ class LoginRequest(_message.Message):
     def __init__(self, username: _Optional[str] = ..., password: _Optional[str] = ...) -> None: ...
 
 class LoginResponse(_message.Message):
-    __slots__ = ("status", "token", "leader_hint", "message")
+    __slots__ = ("status", "token", "leader_hint", "message", "role")
     STATUS_FIELD_NUMBER: _ClassVar[int]
     TOKEN_FIELD_NUMBER: _ClassVar[int]
     LEADER_HINT_FIELD_NUMBER: _ClassVar[int]
     MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    ROLE_FIELD_NUMBER: _ClassVar[int]
     status: str
     token: str
     leader_hint: str
     message: str
-    def __init__(self, status: _Optional[str] = ..., token: _Optional[str] = ..., leader_hint: _Optional[str] = ..., message: _Optional[str] = ...) -> None: ...
+    role: str
+    def __init__(self, status: _Optional[str] = ..., token: _Optional[str] = ..., leader_hint: _Optional[str] = ..., message: _Optional[str] = ..., role: _Optional[str] = ...) -> None: ...
 
 class LogoutRequest(_message.Message):
     __slots__ = ("token",)
@@ -247,21 +261,25 @@ class TimeoutNowResponse(_message.Message):
     def __init__(self, from_node: _Optional[str] = ..., to_node: _Optional[str] = ..., term: _Optional[int] = ..., success: _Optional[bool] = ...) -> None: ...
 
 class MembershipChangeRequest(_message.Message):
-    __slots__ = ("action", "node_id", "host", "raft_port", "client_port")
+    __slots__ = ("action", "node_id", "host", "raft_port", "client_port", "token")
     ACTION_FIELD_NUMBER: _ClassVar[int]
     NODE_ID_FIELD_NUMBER: _ClassVar[int]
     HOST_FIELD_NUMBER: _ClassVar[int]
     RAFT_PORT_FIELD_NUMBER: _ClassVar[int]
     CLIENT_PORT_FIELD_NUMBER: _ClassVar[int]
+    TOKEN_FIELD_NUMBER: _ClassVar[int]
     action: str
     node_id: str
     host: str
     raft_port: int
     client_port: int
-    def __init__(self, action: _Optional[str] = ..., node_id: _Optional[str] = ..., host: _Optional[str] = ..., raft_port: _Optional[int] = ..., client_port: _Optional[int] = ...) -> None: ...
+    token: str
+    def __init__(self, action: _Optional[str] = ..., node_id: _Optional[str] = ..., host: _Optional[str] = ..., raft_port: _Optional[int] = ..., client_port: _Optional[int] = ..., token: _Optional[str] = ...) -> None: ...
 
 class TransferLeadershipRequest(_message.Message):
-    __slots__ = ("target_node",)
+    __slots__ = ("target_node", "token")
     TARGET_NODE_FIELD_NUMBER: _ClassVar[int]
+    TOKEN_FIELD_NUMBER: _ClassVar[int]
     target_node: str
-    def __init__(self, target_node: _Optional[str] = ...) -> None: ...
+    token: str
+    def __init__(self, target_node: _Optional[str] = ..., token: _Optional[str] = ...) -> None: ...
