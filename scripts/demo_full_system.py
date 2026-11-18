@@ -29,6 +29,9 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
 
+from dist_ticket_booking.monitoring.console import setup_console  # noqa: E402
+
+setup_console()
 from scripts.monitor_cluster import probe_llm, probe_node, render_dashboard  # noqa: E402
 from scripts.run_cluster import ClusterManager, DEFAULT_CLUSTER_SPEC  # noqa: E402
 from scripts.verify_milestone2 import wait_leader, wait_llm_ready  # noqa: E402

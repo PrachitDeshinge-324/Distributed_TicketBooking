@@ -10,6 +10,9 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
 
+from dist_ticket_booking.monitoring.console import setup_console  # noqa: E402
+
+setup_console()
 from dist_ticket_booking.grpc.service import TicketClient
 from scripts.run_cluster import ClusterManager, DEFAULT_CLUSTER_SPEC
 

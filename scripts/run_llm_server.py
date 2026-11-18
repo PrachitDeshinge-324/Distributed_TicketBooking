@@ -9,6 +9,9 @@ from concurrent import futures
 
 import grpc
 
+from dist_ticket_booking.monitoring.console import setup_console  # noqa: E402
+
+setup_console()
 from dist_ticket_booking.grpc import ticket_service_pb2_grpc
 from dist_ticket_booking.grpc.service import LLMServicer
 from dist_ticket_booking.llm.domain_llm import DEFAULT_MODEL, DomainLLM
@@ -40,7 +43,8 @@ def serve(port=50060, model_name=DEFAULT_MODEL):
     print("=" * 78, flush=True)
 
     try:
-        server.wait_for_termination()
+        while server.wait_for_termination(timeout=1):  # True = timed out; polling keeps Ctrl+C working on Windows
+            pass
     except KeyboardInterrupt:
         logger.info("Shutting down LLM server")
         server.stop(0)

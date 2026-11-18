@@ -90,3 +90,8 @@ DEMO_VIDEO_SCRIPT.md
 *.mov
 docs/*.png
 AOS.png
+
+# One-command demo launcher: private venv, generated terminal scripts and logs
+.demo_venv/
+.demo_tools/
+.demo/

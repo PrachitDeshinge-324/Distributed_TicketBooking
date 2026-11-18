@@ -10,9 +10,46 @@ A gRPC-based, multi-node distributed booking system in Python implementing the *
 
 ## Contents
 
-**[▶ Run the Demo in 5 Terminals](#run-the-demo-in-5-terminals-step-by-step)** · [Milestones Deliverables](#milestones-deliverables) · [Raft Paper Coverage](#raft-paper-coverage) · [Assignment Requirements Coverage](#assignment-requirements-coverage) · [Architecture](#architecture) · [Demo Topology](#demo-topology-5-nodes) · [Raft Consensus Implementation](#raft-consensus-implementation) · [gRPC Contract](#grpc-contract) · [Quick Start & Setup](#quick-start--setup) · [Running the Demos](#running-the-demos) · [Natural-Language Booking](#natural-language-booking-assistant) · [Cluster Administration](#cluster-administration) · [Multi-Machine Deployment](#multi-machine-deployment) · [Testing](#testing) · [Project Structure](#project-structure)
+**[▶ One-command Quick Start (Windows / macOS / Linux)](#quick-start-one-command-on-windows-macos-or-linux)** · **[Manual 5-terminal steps](#run-the-demo-in-5-terminals-step-by-step)** · [Milestones Deliverables](#milestones-deliverables) · [Raft Paper Coverage](#raft-paper-coverage) · [Assignment Requirements Coverage](#assignment-requirements-coverage) · [Architecture](#architecture) · [Demo Topology](#demo-topology-5-nodes) · [Raft Consensus Implementation](#raft-consensus-implementation) · [gRPC Contract](#grpc-contract) · [Quick Start & Setup](#quick-start--setup) · [Running the Demos](#running-the-demos) · [Natural-Language Booking](#natural-language-booking-assistant) · [Cluster Administration](#cluster-administration) · [Multi-Machine Deployment](#multi-machine-deployment) · [Testing](#testing) · [Project Structure](#project-structure)
 
 ---
+
+## Quick Start: one command on Windows, macOS or Linux
+
+**Requirements:** Python 3.10 or newer, an internet connection for the first run (about 2–3 GB: PyTorch and the 1.6 GB LLM, downloaded once), and a desktop terminal. Nothing else; the launcher installs the rest into its own private folder (`.demo_venv`) and never touches your existing Python packages.
+
+| Your system | Run this (from the project folder) |
+|---|---|
+| **Windows** | double-click **`run_demo.bat`**, or in cmd / PowerShell: `run_demo.bat` |
+| **macOS** | double-click **`run_demo.command`**, or: `bash run_demo.sh` |
+| **Linux** | `bash run_demo.sh` |
+
+It then:
+1. **Picks a Python:** the project's own `.demo_venv` if it already exists (a broken one is recreated); otherwise any Python 3.10+ on the computer: PATH, Homebrew, python.org, pyenv, conda/miniforge environments, and on Windows the `py` launcher and standard install folders (3.11/3.12 preferred); if there is **none at all**, it downloads a private Python 3.11 into `.demo_tools` with [uv](https://docs.astral.sh/uv/) (no admin rights, nothing installed system-wide). It never stops just because Python is missing.
+2. Creates `.demo_venv` and installs the requirements into it. **Your own environments are never modified:** any Python, venv or conda env it finds is only *read* to create `.demo_venv`. Active-venv, `PYTHONPATH`, `PIP_*` and `pip.conf` settings are ignored during the install, and only a folder that really is a virtual environment is ever deleted and recreated. To remove every trace, delete `.demo_venv`, `.demo_tools` and `.demo`. (The LLM model is stored in the standard Hugging Face cache, `~/.cache/huggingface`, so it is shared with other projects instead of being downloaded twice.)
+3. Downloads the LLM.
+4. **Opens five terminal windows and starts one process in each**:
+
+| Window | Runs |
+|---|---|
+| **T1 LLM server** | `scripts/run_llm_server.py` |
+| **T2 / T3 / T4 Raft nodes** | `scripts/run_node.py` for `node-1`, `node-2`, `node-3` |
+| **T5 client** | waits for the leader election, then runs `scripts/client_demo.py`; afterwards the window is an interactive shell ready for the commands in Steps 4–6 below |
+
+The second start is fast (nothing to install). Every window stays open when its process ends and prints the command to start it again.
+
+Options (append to the command): `--no-llm` skips PyTorch and the model and the LLM window (small install, FAQs then use keyword rules) · `--keep` keeps data from a previous run · `--background` opens no windows: everything runs hidden, logs go to `.demo/logs`, and the client walkthrough prints in the current terminal (also used automatically over SSH or without a display) · `python scripts/demo_launcher.py stop` stops a `--background` run.
+
+Tested: macOS (clean install into a fresh venv, windows launch and background mode). The Windows and Linux paths use only standard OS mechanisms (`cmd /k` consoles; `gnome-terminal`, `konsole`, `xfce4-terminal`, `kitty`, `alacritty`, `xterm` and others) and fall back to `--background` if no terminal can be opened.
+
+| Problem | Fix |
+|---|---|
+| "Could not download Python automatically" | Only happens without internet on a computer with no Python 3.10+: install it from python.org (Windows: tick *Add python.exe to PATH*); Debian/Ubuntu: `sudo apt install python3 python3-venv python3-pip` |
+| "Port(s) … are already in use" | An earlier demo is still running: close its windows (or `python scripts/demo_launcher.py stop`) |
+| PyTorch or the model cannot be downloaded | The demo still works; run again with `--no-llm`, or fix the connection and run `python scripts/demo_launcher.py setup --reinstall` |
+| macOS asks "Terminal wants to control…" | Click OK once; it is only used to open the five windows |
+
+The rest of this section explains the same demo started **by hand**, one terminal at a time.
 
 ## Run the Demo in 5 Terminals (step by step)
 
@@ -32,11 +69,19 @@ Which of T2–T4 becomes leader is decided by the Raft election; it is shown in 
 
 ```bash
 cd Distributed_TicketBooking          # the project folder
-conda activate AOS                    # or: source .venv/bin/activate  (see Quick Start & Setup)
 ```
-First time only (in one terminal): `pip install -r requirements.txt && pip install -e .`
+then activate an environment that has the requirements (the one-command launcher already created `.demo_venv`; otherwise see [Installation](#installation)):
 
-> **macOS shortcut (optional):** `bash scripts/open_demo_terminals.sh` opens all five Terminal windows with the commands below already running.
+| System | Activate |
+|---|---|
+| macOS / Linux | `source .demo_venv/bin/activate` |
+| Windows cmd | `.demo_venv\Scripts\activate.bat` |
+| Windows PowerShell | `.demo_venv\Scripts\Activate.ps1` |
+| conda | `conda activate AOS` |
+
+First time only, in one terminal: `pip install -r requirements.txt` (nothing else is needed; the scripts find the code themselves). On Windows set `PYTHONUTF8=1` if symbols such as ★ look garbled (`set PYTHONUTF8=1` in cmd).
+
+> Instead of Steps 1–3 you can simply run the one-command launcher above; it does exactly these steps.
 
 ### Step 1 — T1: start the LLM server (wait for the banner, ~10 s)
 
@@ -594,6 +639,7 @@ bash scripts/package_submission.sh   # zips every git-tracked file into Distribu
 ## Project Structure
 
 ```
+run_demo.bat / run_demo.sh / run_demo.command   One-command demo for Windows / Linux, macOS / macOS double-click
 proto/
   ticket_service.proto                gRPC services (Client, App, LLM, Raft)
 src/dist_ticket_booking/
@@ -633,7 +679,7 @@ scripts/
   run_llm_server.py                   Standalone LLM node (Qwen3.5-0.8B)
   monitor_cluster.py                  Live cluster status dashboard
   client_demo.py                      Step-by-step walkthrough of every client function
-  open_demo_terminals.sh              macOS: open the 5 demo terminals in one go
+  demo_launcher.py                    Cross-platform: install, open the 5 terminals, run each (used by run_demo.*)
   demo_concurrency.py                 10-client concurrent race demo
 tests/
   test_raft_unit.py                   Unit tests for Raft internals

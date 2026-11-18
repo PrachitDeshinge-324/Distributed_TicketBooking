@@ -50,7 +50,8 @@ def serve(port=50051, llm_host="localhost", llm_port=50060, local_llm=False):
     logger.info(f"Server started on port {port} (LLM upstream: {llm_host}:{llm_port})")
 
     try:
-        server.wait_for_termination()
+        while server.wait_for_termination(timeout=1):  # True = timed out; polling keeps Ctrl+C working on Windows
+            pass
     except KeyboardInterrupt:
         logger.info("Shutting down server")
         llm_channel.close()

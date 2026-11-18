@@ -10,6 +10,9 @@ sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
 
 import grpc
+from dist_ticket_booking.monitoring.console import setup_console  # noqa: E402
+
+setup_console()
 from dist_ticket_booking.grpc import ticket_service_pb2, ticket_service_pb2_grpc
 from scripts.run_cluster import build_cluster_spec
 

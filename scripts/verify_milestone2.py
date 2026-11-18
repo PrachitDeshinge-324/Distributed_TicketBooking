@@ -33,6 +33,9 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
 
 import grpc  # noqa: E402
 
+from dist_ticket_booking.monitoring.console import setup_console  # noqa: E402
+
+setup_console()
 from dist_ticket_booking.grpc import ticket_service_pb2 as pb  # noqa: E402
 from dist_ticket_booking.grpc import ticket_service_pb2_grpc  # noqa: E402
 from dist_ticket_booking.grpc.service import TicketClient  # noqa: E402

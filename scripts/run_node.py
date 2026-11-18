@@ -12,6 +12,9 @@ import grpc
 # Add src to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
+from dist_ticket_booking.monitoring.console import setup_console  # noqa: E402
+
+setup_console()
 from dist_ticket_booking.business.booking_service import BookingService
 from dist_ticket_booking.grpc import ticket_service_pb2_grpc
 from dist_ticket_booking.grpc.raft_service import RaftServiceServicer
@@ -19,7 +22,7 @@ from dist_ticket_booking.grpc.service import TicketClientServicer, TicketAppServ
 from dist_ticket_booking.llm.domain_llm import DomainLLM
 from dist_ticket_booking.raft import ClusterConfig, RaftNode
 
-_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+_COLOR = setup_console()
 _STYLES = [  # (text in the message, ANSI style) - first match wins
     ("BECAME LEADER", "1;32"), ("STATUS", "1;37"), ("Stepped down", "33"), ("Starting election", "33"),
     ("Pre-vote", "2"), ("Voted for", "33"), ("MEMBERSHIP", "1;35"), ("COMMITTED", "36"),
@@ -187,7 +190,8 @@ def serve(
                          daemon=True).start()
 
     try:
-        client_server.wait_for_termination()
+        while client_server.wait_for_termination(timeout=1):  # True = timed out; polling keeps Ctrl+C working on Windows
+            pass
     except KeyboardInterrupt:
         stop_ticker.set()
         logger.info(f"Stopping node {node_id}...")

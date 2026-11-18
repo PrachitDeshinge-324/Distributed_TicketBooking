@@ -1,0 +1,7 @@
+# Batch files must keep Windows line endings; shell scripts must keep Unix ones,
+# whichever system checks the repository out.
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+*.sh      text eol=lf
+*.command text eol=lf
+*.py      text eol=lf
