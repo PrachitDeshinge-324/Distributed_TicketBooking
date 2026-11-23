@@ -9,6 +9,8 @@ it over the old one makes every update all-or-nothing.
 """
 import json
 import os
+import threading
+import time
 from typing import Any
 
 
@@ -22,12 +24,29 @@ class CorruptStateError(RuntimeError):
 
 def atomic_write_text(path: str, text: str) -> None:
     """Replace the contents of `path` with `text` atomically and durably."""
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, path)  # atomic on POSIX and Windows
+    # Unique temp name: concurrent writers (gRPC handler threads) must not share one file.
+    tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        # On Windows os.replace raises PermissionError (WinError 5/32) if another
+        # handle (reader, antivirus, indexer) has `path` open for a moment: retry.
+        for attempt in range(40):
+            try:
+                os.replace(tmp_path, path)  # atomic on POSIX and Windows
+                return
+            except PermissionError:
+                if attempt == 39:
+                    raise
+                time.sleep(0.01 * (attempt + 1) if attempt < 10 else 0.1)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def atomic_write_json(path: str, data: Any) -> None:
@@ -37,8 +56,13 @@ def atomic_write_json(path: str, data: Any) -> None:
 
 def read_json(path: str) -> Any:
     """Read JSON from `path`; raises CorruptStateError if it is unreadable."""
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise CorruptStateError(f"stable storage file {path} is unreadable: {exc}") from exc
+    for attempt in range(40):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except PermissionError as exc:  # Windows: file briefly locked by a concurrent replace
+            if attempt == 39:
+                raise CorruptStateError(f"stable storage file {path} is unreadable: {exc}") from exc
+            time.sleep(0.01)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CorruptStateError(f"stable storage file {path} is unreadable: {exc}") from exc

@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import socket
@@ -125,6 +126,25 @@ def unpinned(req: str) -> str:
     return "protobuf>=7.35.1" if name.lower() == "protobuf" else name
 
 
+def detect_cuda_tag():
+    """PyTorch wheel index tag ('cu126') if an NVIDIA GPU with a recent enough driver is present.
+
+    PyPI's Windows/Linux torch wheel is CPU-only, so a GPU machine needs the CUDA wheel from
+    download.pytorch.org. The cu126 build needs a driver that supports CUDA >= 12.6 (newer
+    drivers, e.g. CUDA 13.x, run it too). macOS has no CUDA; anything else gets the default build.
+    """
+    if sys.platform == "darwin" or not shutil.which("nvidia-smi"):
+        return None
+    try:
+        out = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=20).stdout
+        m = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", out)
+        if m and (int(m.group(1)), int(m.group(2))) >= (12, 6):
+            return "cu126"
+    except Exception:
+        pass
+    return None
+
+
 def run(cmd, **kw) -> int:
     kw.setdefault("env", clean_env())
     return subprocess.call([str(c) for c in cmd], **kw)
@@ -164,7 +184,8 @@ def setup(args) -> Path:
     core, llm = read_requirements()
     want_llm = not args.no_llm
     stamp_file = VENV / ".demo_install.json"
-    digest = hashlib.sha256(((ROOT / "requirements.txt").read_text() + str(want_llm)).encode()).hexdigest()
+    cuda_tag = detect_cuda_tag()  # part of the digest: a CPU-only venv gets redone on a GPU machine
+    digest = hashlib.sha256(((ROOT / "requirements.txt").read_text() + str(want_llm) + str(cuda_tag)).encode()).hexdigest()
     stamp = json.loads(stamp_file.read_text()) if stamp_file.exists() else {}
     if run([py, "-m", "pip", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
         run([py, "-m", "ensurepip", "--upgrade"])  # venvs made without pip
@@ -183,6 +204,16 @@ def setup(args) -> Path:
                          "Check your internet connection and try again.")
         llm_ok = False
         if want_llm:
+            # PyPI's Windows/Linux torch wheel is CPU-only; with an NVIDIA GPU, take the CUDA build.
+            if cuda_tag:
+                step(f"NVIDIA GPU detected: installing the CUDA build of PyTorch ({cuda_tag})")
+                cuda_torch = [r for r in llm if r.lower().startswith("torch")]
+                idx = ["--index-url", f"https://download.pytorch.org/whl/{cuda_tag}"]
+                if run(pip + cuda_torch + idx) != 0 and run(pip + [unpinned(r) for r in cuda_torch] + idx) != 0:
+                    say("CUDA PyTorch not available; falling back to the default build (CPU).")
+                elif run([py, "-c", "import torch, sys; sys.exit(0 if torch.version.cuda else 1)"]) == 0:
+                    # keep the CUDA torch just installed: pip must not swap it for the CPU wheel
+                    llm = [r for r in llm if not r.lower().startswith("torch")]
             if run(pip + llm) == 0 or run(pip + [unpinned(r) for r in llm]) == 0:
                 llm_ok = True
             else:

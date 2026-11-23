@@ -31,7 +31,7 @@ You need **Python 3.10 or newer** and an internet connection on the first run. N
 | **macOS** | double-click **`run_demo.command`** (or run `bash run_demo.sh`) |
 | **Linux** | run `bash run_demo.sh` |
 
-The first run takes a few minutes: it installs PyTorch and downloads the language model once (Qwen3.5-2B, ~4.5 GB, on Apple Silicon or an NVIDIA GPU; Qwen3.5-0.8B, ~1.6 GB, otherwise). Later runs start in seconds.
+The first run takes a few minutes: it installs PyTorch and downloads the language model once (Qwen3.5-2B, ~4.5 GB, on Apple Silicon or an NVIDIA GPU; Qwen3.5-0.8B, ~1.6 GB, otherwise). Later runs start in seconds. On a Windows/Linux machine with an NVIDIA GPU (driver supporting CUDA 12.6+), the launcher automatically installs the CUDA build of PyTorch (about 2.6 GB extra); without one it uses the normal CPU build.
 
 **Five windows open, one per node:**
 
