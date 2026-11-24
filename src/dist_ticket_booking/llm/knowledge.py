@@ -46,6 +46,12 @@ KNOWLEDGE_BASE: List[Passage] = [
             "I can't give medical advice: why a dose is needed, how well a vaccine protects, side effects "
             "and whether it is safe for you are questions for a doctor or health worker.",
             strict=False, exact=True),
+    Passage("help", ("help", "assist", "assistant", "what can you do", "how can you help", "what do you do",
+                     "capabilities", "features", "who are you", "hello", "hi", "hey"),
+            "I can answer questions about vaccines (COVISHIELD, COVAXIN, CORBEVAX), dose gaps, age rules, "
+            "prices, documents, cancellation and refunds, and check live slot availability. I can also book "
+            "or cancel for you: for example 'book a COVAXIN second dose in Mumbai' or 'cancel booking <ID>'.",
+            strict=False),
     Passage("cancel", ("cancel", "cancellation", "cancelling", "reschedule", "change my appointment"),
             "You can cancel any time until 24 hours before your appointment starts; in the last 24 hours "
             "before it, cancelling is no longer possible. "

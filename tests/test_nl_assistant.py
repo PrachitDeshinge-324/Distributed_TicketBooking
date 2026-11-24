@@ -187,3 +187,20 @@ def test_medical_questions_are_not_answered_by_the_model():
     assert "medical advice" in out and "9 months" in out and "strain" not in out
     made_up = "COVAXIN is extremely effective against omicron variants and causes minimal fever reactions overall."
     assert _grounded(made_up, "what is covaxin") != made_up    # invented content is replaced
+
+
+def test_also_one_for_another_city_repeats_the_last_booking():
+    """'also one for bangalore' after a booking reuses its vaccine and dose; it is not an FAQ."""
+    svc = TicketClientServicer()
+    svc.Register(ticket_service_pb2.RegisterRequest(username="lee", password="pw"), None)
+    tok = svc.Login(ticket_service_pb2.LoginRequest(username="lee", password="pw"), None).token
+    n = iter(range(1000))
+
+    def say(text):
+        return svc.Post(ticket_service_pb2.PostRequest(
+            token=tok, type="assistant", data=json.dumps({"text": text}), request_id=f"r{next(n)}"), None)
+
+    assert say("book covishield dose 1 in delhi").status == "accepted"
+    res = say("also one for banglore")
+    # Vaccine and dose carried over from the last booking; Bangalore has no such slot, so it is reported.
+    assert res.status == "clarify" and "COVISHIELD dose 1 in Bangalore" in res.message

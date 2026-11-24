@@ -55,6 +55,9 @@ def _raft_status(res: dict):
     return status, res.get("message", "")
 
 
+# "also one for Delhi", "another in Mumbai", "ok then at delhi": repeat the last request elsewhere.
+_AGAIN_RE = re.compile(r"\b(also|another|one more|same|too|then|again)\b", re.I)
+
 class PayloadError(ValueError):
     """A Post/ProcessBusinessRequest payload does not match its type's schema."""
 
@@ -153,6 +156,9 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
         # replicated state, so losing it on failover just means asking again.
         self._pending: Dict[str, tuple] = {}
         self._pending_lock = threading.Lock()
+        # The last request each user completed (vaccine, dose), so "also one for Delhi" can
+        # reuse it. Same rules as _pending: serving node only, never replicated.
+        self._recent: Dict[str, tuple] = {}
 
     def _verify_token(self, token: str) -> Optional[str]:
         if self.raft_node is not None:
@@ -455,9 +461,16 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
         bare = confirm or bool(word_place) or is_bare_reply(text, rules, slot_id)
         # The model's intent is not needed when this is a reply to the assistant's question,
         # or when the rules already see a question (merge() would keep "question" anyway).
-        skip_llm = (bare and pending) or rules["action"] == "question"
+        recent = None if pending else self._recent_request(user_id)
+        again = bool(recent and rules["action"] is None and not rules["vaccine"] and not slot_id
+                     and len(text.split()) <= 8 and _AGAIN_RE.search(text))
+        skip_llm = (bare and pending) or rules["action"] == "question" or again
         llm = {} if skip_llm else self._extract_intent_llm(text, intent_context(slots.values()), cities)
         intent = merge(llm, rules, text)
+        if again:  # "also one for Delhi": same request as the last one, with what this adds
+            intent = {**intent, "action": recent["action"], "vaccine": recent["vaccine"],
+                      "dose": rules["dose"] or recent["dose"]}
+            bare = False
         place = word_place or (None if intent.get("city") else unknown_place(text, cities, llm.get("_raw_city"), centres))
         # Naming a (different) vaccine, a booking ID or a slot starts a new request.
         fresh = not bare and any(intent.get(k) for k in ("vaccine", "booking_id")) or bool(slot_id and not bare)
@@ -505,13 +518,27 @@ class TicketClientServicer(ticket_service_pb2_grpc.TicketClientServiceServicer):
             return reply("success", self._query_llm(text, self._build_live_context(text, user_id)))
 
         if plan["kind"] == "book":
-            return done(self._execute("create_booking", {
+            res = self._execute("create_booking", {
                 "user_id": user_id, "ticket_id": plan["slot_id"], "quantity": 1,
                 "priority": 0, "request_id": request_id,
-            }))
+            })
+            slot = slots.get(plan["slot_id"], {})
+            if res.get("status") in ("accepted", "success") and slot:
+                self._set_recent(user_id, {"action": "book", "vaccine": slot.get("vaccine_name"),
+                                           "dose": int(slot.get("dose_number") or 0) or None})
+            return done(res)
         return done(self._execute("cancel_booking", {
             "user_id": user_id, "booking_id": plan["booking_id"], "request_id": request_id,
         }))
+
+    def _set_recent(self, user_id: str, request: dict):
+        with self._pending_lock:
+            self._recent[user_id] = (request, time.monotonic())
+
+    def _recent_request(self, user_id: str) -> Optional[dict]:
+        with self._pending_lock:
+            entry = self._recent.get(user_id)
+        return entry[0] if entry and time.monotonic() - entry[1] < self._PENDING_TTL_S else None
 
     _PENDING_TTL_S = 300  # a reply after 5 minutes starts a new conversation
 

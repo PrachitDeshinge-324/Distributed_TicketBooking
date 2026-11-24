@@ -545,8 +545,14 @@ class DomainLLM:
         for prompt, ids in zip(prompts, gen):
             query, context = _split_prompt(prompt)
             text = _trim_incomplete(_THINK_RE.sub("", tokenizer.decode(ids, skip_special_tokens=True)))
-            results.append(_page_guard(text, query, _split_state(context)[1]) if text
-                           else _keyword_fallback(_without_state(prompt)))
+            if not text:
+                results.append(_keyword_fallback(_without_state(prompt)))
+                continue
+            focused, state = _split_state(context)
+            answer = _page_guard(text, query, state)
+            if _LIVE_MARKER in focused:  # same live-count guardrail as the small model
+                answer = _grounded_availability(answer, focused)
+            results.append(answer)
         return results
 
     def _run_pipeline_batch(self, prompts: list) -> list:

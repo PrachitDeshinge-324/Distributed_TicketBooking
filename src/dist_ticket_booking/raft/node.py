@@ -436,56 +436,6 @@ class RaftNode:
     #  LEADER ELECTION
     # ================================================================
 
-    def _pre_vote(self) -> bool:
-        """Pre-Vote round (Raft thesis 9.6).
-
-        Ask the peers whether they *would* vote for us in the next term,
-        without anyone changing state. Only if a majority says yes do we
-        increment our term. A node cut off by a partition therefore cannot
-        keep inflating its term and force a needless re-election when the
-        partition heals.
-        """
-        with self._lock:
-            if not self._running or self.state == NodeState.LEADER or not self.config.voting:
-                return False
-            term = self.current_term + 1
-            last_log_index = self.log.last_index()
-            last_log_term = self.log.last_term()
-            peers = list(self.config.peers)
-            needed = self.config.majority
-        granted = [1]  # ourselves
-        done = threading.Event()
-        count_lock = threading.Lock()
-
-        def ask(peer_id):
-            stub = self._peer_stubs.get(peer_id)
-            if not stub or self.is_partitioned_from(peer_id):
-                return
-            try:
-                resp = stub.RequestVote(ticket_service_pb2.RequestVoteRequest(
-                    from_node=self.node_id, to_node=peer_id, term=term,
-                    last_log_index=last_log_index, last_log_term=last_log_term, pre_vote=True,
-                ), timeout=0.4)
-            except Exception:
-                return
-            if resp.vote_granted:
-                with count_lock:
-                    granted[0] += 1
-                    if granted[0] >= needed:
-                        done.set()
-
-        threads = [threading.Thread(target=ask, args=(p,), daemon=True) for p in peers]
-        for t in threads:
-            t.start()
-        deadline = time.monotonic() + 0.5
-        while not done.is_set() and time.monotonic() < deadline and any(t.is_alive() for t in threads):
-            done.wait(0.01)
-        ok = granted[0] >= needed
-        if not ok:
-            logger.info(f"[{self.node_id}] Pre-vote for term {term} failed "
-                        f"({granted[0]}/{needed}); staying at term {self.current_term}")
-        return ok
-
     def _start_election(self, leadership_transfer: bool = False):
         """Transition to candidate and solicit votes from all peers."""
         if not leadership_transfer and not self.config.is_solo and not self._pre_vote():
@@ -581,6 +531,134 @@ class RaftNode:
                     f"(got {votes_received}/{self.config.majority} votes)"
                 )
                 self._reset_election_timer()
+
+    def _pre_vote(self) -> bool:
+        """Pre-Vote round (Raft thesis 9.6).
+
+        Ask the peers whether they *would* vote for us in the next term,
+        without anyone changing state. Only if a majority says yes do we
+        increment our term. A node cut off by a partition therefore cannot
+        keep inflating its term and force a needless re-election when the
+        partition heals.
+        """
+        with self._lock:
+            if not self._running or self.state == NodeState.LEADER or not self.config.voting:
+                return False
+            term = self.current_term + 1
+            last_log_index = self.log.last_index()
+            last_log_term = self.log.last_term()
+            peers = list(self.config.peers)
+            needed = self.config.majority
+        granted = [1]  # ourselves
+        done = threading.Event()
+        count_lock = threading.Lock()
+
+        def ask(peer_id):
+            stub = self._peer_stubs.get(peer_id)
+            if not stub or self.is_partitioned_from(peer_id):
+                return
+            try:
+                resp = stub.RequestVote(ticket_service_pb2.RequestVoteRequest(
+                    from_node=self.node_id, to_node=peer_id, term=term,
+                    last_log_index=last_log_index, last_log_term=last_log_term, pre_vote=True,
+                ), timeout=0.4)
+            except Exception:
+                return
+            if resp.vote_granted:
+                with count_lock:
+                    granted[0] += 1
+                    if granted[0] >= needed:
+                        done.set()
+
+        threads = [threading.Thread(target=ask, args=(p,), daemon=True) for p in peers]
+        for t in threads:
+            t.start()
+        deadline = time.monotonic() + 0.5
+        while not done.is_set() and time.monotonic() < deadline and any(t.is_alive() for t in threads):
+            done.wait(0.01)
+        ok = granted[0] >= needed
+        if not ok:
+            logger.info(f"[{self.node_id}] Pre-vote for term {term} failed "
+                        f"({granted[0]}/{needed}); staying at term {self.current_term}")
+        return ok
+
+    def handle_request_vote(self, request) -> ticket_service_pb2.RequestVoteResponse:
+            """Handle incoming RequestVote RPC from a candidate."""
+            with self._lock:
+                my_last_term, my_last_index = self.log.last_term(), self.log.last_index()
+                candidate_log_ok = (
+                    request.last_log_term > my_last_term
+                    or (request.last_log_term == my_last_term and request.last_log_index >= my_last_index)
+                )
+                leader_alive = self.state == NodeState.LEADER or (
+                    self.state == NodeState.FOLLOWER
+                    and self._last_leader_contact is not None
+                    and time.monotonic() - self._last_leader_contact
+                    < self.config.election_timeout_min_ms / 1000.0
+                )
+
+                if request.pre_vote:
+                    # Pre-Vote: answer "would I vote for you?" without touching
+                    # our term, vote or timers.
+                    return ticket_service_pb2.RequestVoteResponse(
+                        from_node=self.node_id,
+                        to_node=request.from_node,
+                        term=self.current_term,
+                        vote_granted=(request.term > self.current_term and candidate_log_ok
+                                      and not leader_alive),
+                    )
+
+                # Raft thesis 4.2.3 / 6.4.1: while we still hear from a live leader,
+                # ignore vote requests entirely (without adopting their term). A
+                # partitioned or flaky node then cannot depose a healthy leader, and
+                # a leader's read lease stays valid for one minimum election timeout.
+                # A leadership transfer is the one deliberate exception.
+                if (
+                    not request.leadership_transfer
+                    and self.state == NodeState.FOLLOWER
+                    and leader_alive
+                ):
+                    return ticket_service_pb2.RequestVoteResponse(
+                        from_node=self.node_id,
+                        to_node=request.from_node,
+                        term=self.current_term,
+                        vote_granted=False,
+                    )
+
+                if request.term > self.current_term:
+                    self._step_down(request.term)
+
+                vote_granted = False
+
+                if request.term < self.current_term:
+                    vote_granted = False
+                elif self.voted_for is None or self.voted_for == request.from_node:
+                    my_last_term = self.log.last_term()
+                    my_last_index = self.log.last_index()
+
+                    log_ok = (
+                        request.last_log_term > my_last_term
+                        or (
+                            request.last_log_term == my_last_term
+                            and request.last_log_index >= my_last_index
+                        )
+                    )
+
+                    if log_ok:
+                        self.voted_for = request.from_node
+                        vote_granted = True
+                        self._persist_state()
+                        self._reset_election_timer()
+                        logger.info(
+                            f"[{self.node_id}] Voted for {request.from_node} in term {self.current_term}"
+                        )
+
+                return ticket_service_pb2.RequestVoteResponse(
+                    from_node=self.node_id,
+                    to_node=request.from_node,
+                    term=self.current_term,
+                    vote_granted=vote_granted,
+                )
 
     def _become_leader(self):
         """Transition to leader state. Must be called under self._lock."""
@@ -857,157 +935,6 @@ class RaftNode:
     #  RPC HANDLERS (called by RaftServiceServicer)
     # ================================================================
 
-    def handle_request_vote(self, request) -> ticket_service_pb2.RequestVoteResponse:
-        """Handle incoming RequestVote RPC from a candidate."""
-        with self._lock:
-            my_last_term, my_last_index = self.log.last_term(), self.log.last_index()
-            candidate_log_ok = (
-                request.last_log_term > my_last_term
-                or (request.last_log_term == my_last_term and request.last_log_index >= my_last_index)
-            )
-            leader_alive = self.state == NodeState.LEADER or (
-                self.state == NodeState.FOLLOWER
-                and self._last_leader_contact is not None
-                and time.monotonic() - self._last_leader_contact
-                < self.config.election_timeout_min_ms / 1000.0
-            )
-
-            if request.pre_vote:
-                # Pre-Vote: answer "would I vote for you?" without touching
-                # our term, vote or timers.
-                return ticket_service_pb2.RequestVoteResponse(
-                    from_node=self.node_id,
-                    to_node=request.from_node,
-                    term=self.current_term,
-                    vote_granted=(request.term > self.current_term and candidate_log_ok
-                                  and not leader_alive),
-                )
-
-            # Raft thesis 4.2.3 / 6.4.1: while we still hear from a live leader,
-            # ignore vote requests entirely (without adopting their term). A
-            # partitioned or flaky node then cannot depose a healthy leader, and
-            # a leader's read lease stays valid for one minimum election timeout.
-            # A leadership transfer is the one deliberate exception.
-            if (
-                not request.leadership_transfer
-                and self.state == NodeState.FOLLOWER
-                and leader_alive
-            ):
-                return ticket_service_pb2.RequestVoteResponse(
-                    from_node=self.node_id,
-                    to_node=request.from_node,
-                    term=self.current_term,
-                    vote_granted=False,
-                )
-
-            if request.term > self.current_term:
-                self._step_down(request.term)
-
-            vote_granted = False
-
-            if request.term < self.current_term:
-                vote_granted = False
-            elif self.voted_for is None or self.voted_for == request.from_node:
-                my_last_term = self.log.last_term()
-                my_last_index = self.log.last_index()
-
-                log_ok = (
-                    request.last_log_term > my_last_term
-                    or (
-                        request.last_log_term == my_last_term
-                        and request.last_log_index >= my_last_index
-                    )
-                )
-
-                if log_ok:
-                    self.voted_for = request.from_node
-                    vote_granted = True
-                    self._persist_state()
-                    self._reset_election_timer()
-                    logger.info(
-                        f"[{self.node_id}] Voted for {request.from_node} in term {self.current_term}"
-                    )
-
-            return ticket_service_pb2.RequestVoteResponse(
-                from_node=self.node_id,
-                to_node=request.from_node,
-                term=self.current_term,
-                vote_granted=vote_granted,
-            )
-
-    def handle_append_entries(self, request) -> ticket_service_pb2.AppendEntriesResponse:
-        """Handle incoming AppendEntries RPC (heartbeat or log replication)."""
-        with self._lock:
-            if request.term < self.current_term:
-                return ticket_service_pb2.AppendEntriesResponse(
-                    from_node=self.node_id,
-                    to_node=request.from_node,
-                    term=self.current_term,
-                    entry_appended=False,
-                    match_index=self.log.last_index(),
-                )
-
-            if request.term > self.current_term or self.state != NodeState.FOLLOWER:
-                self._step_down(request.term)
-            self.leader_id = request.from_node
-            self._last_leader_contact = time.monotonic()
-            self._reset_election_timer()
-
-            # Log consistency check (snapshot-aware: anything at or below the
-            # snapshot boundary is committed and therefore matches).
-            if request.prev_log_index > self.log.last_included_index:
-                prev_term = self.log.term_at(request.prev_log_index)
-                if prev_term is None or prev_term != request.prev_log_term:
-                    return ticket_service_pb2.AppendEntriesResponse(
-                        from_node=self.node_id,
-                        to_node=request.from_node,
-                        term=self.current_term,
-                        entry_appended=False,
-                        match_index=self.log.last_index(),
-                    )
-
-            # Append new entries (handling conflict truncations)
-            new_entries = []
-            truncated = False
-            for proto_entry in request.entries:
-                entry = LogEntry.from_proto(proto_entry)
-                if entry.index <= self.log.last_included_index:
-                    continue  # already covered by our snapshot
-                if new_entries:
-                    new_entries.append(entry)  # everything after the first new entry is new
-                    continue
-                existing = self.log.get(entry.index)
-                if existing is not None and existing.term != entry.term:
-                    # Conflict: drop our entry and everything after it (Raft 5.3).
-                    self.log.truncate_from(entry.index)
-                    truncated = True
-                    existing = None
-                if existing is None:
-                    new_entries.append(entry)
-            self.log.extend(new_entries)  # one durable write for the whole batch
-            if truncated or any(e.command_type == "config" for e in new_entries):
-                self._refresh_membership()  # configurations take effect when appended
-
-            # Index of the last entry this RPC vouches for. Using our own
-            # last_index() here would be unsafe: stale entries from an old
-            # term beyond the leader's range could be counted (or applied)
-            # as if they matched the leader's log (Raft Figure 2, rule 5).
-            last_new_index = max(request.prev_log_index + len(request.entries), self.log.last_included_index)
-
-            # Update commit index
-            new_commit = min(request.commit_index, last_new_index)
-            if new_commit > self.commit_index:  # commitIndex never moves backwards
-                self.commit_index = new_commit
-                self._apply_committed_entries()
-
-            return ticket_service_pb2.AppendEntriesResponse(
-                from_node=self.node_id,
-                to_node=request.from_node,
-                term=self.current_term,
-                entry_appended=True,
-                match_index=last_new_index,
-            )
-
     def handle_install_snapshot(self, request) -> ticket_service_pb2.InstallSnapshotResponse:
         """Handle InstallSnapshot RPC from the leader (Raft paper, Figure 13)."""
         with self._lock:
@@ -1121,25 +1048,6 @@ class RaftNode:
     # ================================================================
     #  CLIENT REQUEST INTERFACE
     # ================================================================
-
-    def has_read_lease(self) -> bool:
-        """True if a majority confirmed our leadership within the minimum
-        election timeout (leader lease, Raft thesis 6.4.1).
-
-        Followers ignore vote requests for that long after hearing from us,
-        so no other leader can exist yet and a local read is linearizable.
-        Assumes clocks on the nodes advance at roughly the same rate.
-        """
-        with self._lock:
-            if self.state != NodeState.LEADER:
-                return False
-            if self.config.is_solo:
-                return True
-            lease = self.config.election_timeout_min_ms / 1000.0
-            now = time.monotonic()
-            live = 1 + sum(1 for t in self._last_ack.values() if now - t < lease)
-            return live >= self.config.majority
-
     def wait_until_ready_for_reads(self, timeout: float = 3.0) -> bool:
         """Block until this leader may serve a read without it being stale.
 
@@ -1158,6 +1066,24 @@ class RaftNode:
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.02)
+
+    def has_read_lease(self) -> bool:
+        """True if a majority confirmed our leadership within the minimum
+        election timeout (leader lease, Raft thesis 6.4.1).
+
+        Followers ignore vote requests for that long after hearing from us,
+        so no other leader can exist yet and a local read is linearizable.
+        Assumes clocks on the nodes advance at roughly the same rate.
+        """
+        with self._lock:
+            if self.state != NodeState.LEADER:
+                return False
+            if self.config.is_solo:
+                return True
+            lease = self.config.election_timeout_min_ms / 1000.0
+            now = time.monotonic()
+            live = 1 + sum(1 for t in self._last_ack.values() if now - t < lease)
+            return live >= self.config.majority
 
     def has_quorum_contact(self) -> bool:
         """True if a majority (including self) acked us within the election timeout.
@@ -1232,6 +1158,80 @@ class RaftNode:
             with self._lock:
                 self._pending_requests.pop(entry.index, None)
             return {"status": "unavailable", "message": "commit_timeout"}
+
+    def handle_append_entries(self, request) -> ticket_service_pb2.AppendEntriesResponse:
+            """Handle incoming AppendEntries RPC (heartbeat or log replication)."""
+            with self._lock:
+                if request.term < self.current_term:
+                    return ticket_service_pb2.AppendEntriesResponse(
+                        from_node=self.node_id,
+                        to_node=request.from_node,
+                        term=self.current_term,
+                        entry_appended=False,
+                        match_index=self.log.last_index(),
+                    )
+
+                if request.term > self.current_term or self.state != NodeState.FOLLOWER:
+                    self._step_down(request.term)
+                self.leader_id = request.from_node
+                self._last_leader_contact = time.monotonic()
+                self._reset_election_timer()
+
+                # Log consistency check (snapshot-aware: anything at or below the
+                # snapshot boundary is committed and therefore matches).
+                if request.prev_log_index > self.log.last_included_index:
+                    prev_term = self.log.term_at(request.prev_log_index)
+                    if prev_term is None or prev_term != request.prev_log_term:
+                        return ticket_service_pb2.AppendEntriesResponse(
+                            from_node=self.node_id,
+                            to_node=request.from_node,
+                            term=self.current_term,
+                            entry_appended=False,
+                            match_index=self.log.last_index(),
+                        )
+
+                # Append new entries (handling conflict truncations)
+                new_entries = []
+                truncated = False
+                for proto_entry in request.entries:
+                    entry = LogEntry.from_proto(proto_entry)
+                    if entry.index <= self.log.last_included_index:
+                        continue  # already covered by our snapshot
+                    if new_entries:
+                        new_entries.append(entry)  # everything after the first new entry is new
+                        continue
+                    existing = self.log.get(entry.index)
+                    if existing is not None and existing.term != entry.term:
+                        # Conflict: drop our entry and everything after it (Raft 5.3).
+                        self.log.truncate_from(entry.index)
+                        truncated = True
+                        existing = None
+                    if existing is None:
+                        new_entries.append(entry)
+                self.log.extend(new_entries)  # one durable write for the whole batch
+                if truncated or any(e.command_type == "config" for e in new_entries):
+                    self._refresh_membership()  # configurations take effect when appended
+
+                # Index of the last entry this RPC vouches for. Using our own
+                # last_index() here would be unsafe: stale entries from an old
+                # term beyond the leader's range could be counted (or applied)
+                # as if they matched the leader's log (Raft Figure 2, rule 5).
+                last_new_index = max(request.prev_log_index + len(request.entries), self.log.last_included_index)
+
+                # Update commit index
+                new_commit = min(request.commit_index, last_new_index)
+                if new_commit > self.commit_index:  # commitIndex never moves backwards
+                    self.commit_index = new_commit
+                    self._apply_committed_entries()
+
+                return ticket_service_pb2.AppendEntriesResponse(
+                    from_node=self.node_id,
+                    to_node=request.from_node,
+                    term=self.current_term,
+                    entry_appended=True,
+                    match_index=last_new_index,
+                )
+
 
     def get_leader_address(self) -> Optional[str]:
         """Return 'host:port' of current leader for client redirect."""
